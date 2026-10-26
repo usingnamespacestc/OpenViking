@@ -8,7 +8,7 @@ import asyncio
 import time
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Mapping, Optional
 
 from openviking.config.vlm import VLMResolver
 from openviking.core.context import (
@@ -1349,11 +1349,15 @@ class ReindexExecutor:
         ctx: RequestContext,
         recursive: bool = True,
         ingest_options: IngestOptions | None = None,
+        vector_inventory: Optional[Mapping[str, Mapping[str, Any]]] = None,
     ) -> None:
         viking_fs = get_viking_fs()
+        root_is_dir = False
+        directory_uris: set[str] = set()
         if await viking_fs.exists(uri, ctx=ctx):
             stat = await viking_fs.stat(uri, ctx=ctx, skip_count=True)
-            if stat.get("isDir", stat.get("is_dir")):
+            root_is_dir = bool(stat.get("isDir", stat.get("is_dir")))
+            if root_is_dir:
                 entries = (
                     await self._tree_all(viking_fs, uri, show_all_hidden=False, ctx=ctx)
                     if recursive
@@ -1364,21 +1368,48 @@ class ReindexExecutor:
                     entry_uri = entry.get("uri")
                     if entry_uri and entry.get("isDir"):
                         directory_uris.add(entry_uri)
-                await self._reindex_memory_directory_chain(
-                    **self._with_ingest_options(
-                        {
-                            "directory_uris": sorted(directory_uris),
-                            "counters": counters,
-                            "ctx": ctx,
-                        },
-                        ingest_options,
-                    )
-                )
                 file_uris = [entry["uri"] for entry in entries if not entry.get("isDir")]
             else:
                 file_uris = [uri]
         else:
             raise NotFoundError(uri, "memory")
+
+        # Read the complete V inventory before mutating any directory or file so a
+        # rate-limited or failed vector read never leaves partial directory writes.
+        if vector_inventory is None:
+            service = get_service()
+            assert service.vikingdb_manager is not None
+            inventory = await self._read_reindex_inventory(
+                service.vikingdb_manager,
+                uri=uri,
+                ctx=self._content_owner_ctx(uri, ctx),
+                recursive=root_is_dir and recursive,
+            )
+        else:
+            inventory = dict(vector_inventory)
+
+        if root_is_dir and directory_uris:
+            await self._reindex_memory_directory_chain(
+                **self._with_ingest_options(
+                    {
+                        "directory_uris": sorted(directory_uris),
+                        "counters": counters,
+                        "ctx": ctx,
+                    },
+                    ingest_options,
+                )
+            )
+        existing_by_uri_level: dict[tuple[str, int], dict[str, Any]] = {}
+        for record_id, record in sorted(inventory.items()):
+            record_uri = str(record.get("uri") or "")
+            try:
+                level = int(record.get("level", -1))
+            except (TypeError, ValueError):
+                continue
+            if record_uri and level in {0, 1, 2}:
+                existing_by_uri_level.setdefault((record_uri, level), dict(record, id=record_id))
+
+        overview_cache: dict[str, dict[str, str]] = {}
 
         async def process_file(file_uri: str) -> _ReindexCounters:
             file_counters = _ReindexCounters(scanned_records=1)
@@ -1391,14 +1422,15 @@ class ReindexExecutor:
                 return file_counters
             body = body_source.text if body_source.exists else ""
             memory_content = MemoryFileUtils.read(body).content if body else ""
-            existing = await self._fetch_existing_record(
-                uri=file_uri,
-                level=2,
-                ctx=self._content_owner_ctx(file_uri, ctx),
-            )
+            existing = existing_by_uri_level.get((file_uri, int(ContextLevel.DETAIL)))
             abstract = self._best_non_empty(
                 self._record_abstract(existing),
-                await self._best_file_summary(file_uri, ctx=ctx),
+                await self._best_memory_file_summary(
+                    file_uri,
+                    ctx=ctx,
+                    existing=existing,
+                    overview_cache=overview_cache,
+                ),
             )
             if not body and existing is None:
                 file_counters.unsupported_records += 1
@@ -1460,6 +1492,60 @@ class ReindexExecutor:
             concurrency=concurrency,
             processor=process_file,
             counters=counters,
+        )
+
+    async def _read_reindex_inventory(
+        self,
+        vikingdb: Any,
+        *,
+        uri: str,
+        ctx: RequestContext,
+        recursive: bool,
+    ) -> dict[str, dict[str, Any]]:
+        retry_delays = (0.0, 0.25, 1.0)
+        for attempt, delay in enumerate(retry_delays, start=1):
+            if delay:
+                await asyncio.sleep(delay)
+            try:
+                return await vikingdb.get_reindex_inventory_under_uri(
+                    uri,
+                    ctx=ctx,
+                    output_fields=["abstract", "context_type", "owner_user_id"],
+                    recursive=recursive,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                if attempt == len(retry_delays) or not bool(getattr(exc, "retryable", False)):
+                    raise
+                logger.warning(
+                    "Reindex vector inventory was rate limited; retrying uri=%s attempt=%d/%d "
+                    "error=%s",
+                    uri,
+                    attempt,
+                    len(retry_delays),
+                    exc,
+                )
+        raise AssertionError("unreachable")
+
+    async def _best_memory_file_summary(
+        self,
+        uri: str,
+        *,
+        ctx: RequestContext,
+        existing: Optional[dict[str, Any]],
+        overview_cache: dict[str, dict[str, str]],
+    ) -> str:
+        parent_uri = VikingURI(uri).parent.uri
+        if parent_uri not in overview_cache:
+            raw = await self._safe_read_text(f"{parent_uri}/.overview.md", ctx=ctx)
+            overview_cache[parent_uri] = (
+                SemanticProcessor._parse_overview_md(raw) if raw else {}
+            )
+        file_name = uri.rsplit("/", 1)[-1]
+        return self._best_non_empty(
+            overview_cache[parent_uri].get(file_name, ""),
+            self._record_abstract(existing),
         )
 
     async def _reindex_memory_directory_chain(

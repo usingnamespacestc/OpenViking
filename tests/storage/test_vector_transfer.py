@@ -741,6 +741,33 @@ async def test_incremental_inventory_projects_request_scalar_fields():
 
 
 @pytest.mark.asyncio
+async def test_reindex_inventory_reads_one_complete_prefix_without_scroll_pages():
+    root = "viking://user/alice/memories"
+    backend = _RealAclMemoryTransferBackend(
+        [
+            _record("root-l0", root, level=0, abstract="root abstract"),
+            _record("file-l2", f"{root}/a.md", level=2, md5="ma", abstract="A"),
+            _record("chunk-l2", f"{root}/a.md#chunk_0000", level=2, abstract="chunk"),
+            _record("outside", "viking://user/alice/resources/a.md", level=2),
+        ]
+    )
+
+    records = await backend.get_reindex_inventory_under_uri(
+        root,
+        ctx=_ctx(),
+        output_fields=["abstract", "context_type", "owner_user_id"],
+    )
+
+    assert set(records) == {"root-l0", "file-l2", "chunk-l2"}
+    assert records["file-l2"]["abstract"] == "A"
+    assert backend.scroll_filters == []
+    assert len(backend.filter_calls) == 1
+    _filter, limit, offset = backend.filter_calls[0]
+    assert limit == 3
+    assert offset == 0
+
+
+@pytest.mark.asyncio
 async def test_incremental_inventory_by_uris_reads_exact_uri_groups_only():
     first = "viking://resources/docs/a.py"
     second = "viking://resources/docs/b.py"

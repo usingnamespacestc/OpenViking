@@ -2362,6 +2362,79 @@ class VikingVectorIndexBackend:
         assert last_error is not None
         raise last_error
 
+    async def get_reindex_inventory_under_uri(
+        self,
+        uri: str,
+        *,
+        ctx: RequestContext,
+        output_fields: Optional[List[str]] = None,
+        recursive: bool = True,
+    ) -> Dict[str, Dict[str, Any]]:
+        """Load one complete lightweight reindex inventory without page-level planning."""
+        projection = list(
+            dict.fromkeys(
+                [
+                    *INCREMENTAL_INVENTORY_OUTPUT_FIELDS,
+                    *(output_fields or []),
+                ]
+            )
+        )
+        canonical_uri = resolve_uri(uri).uri.rstrip("/")
+        scope = And(
+            [
+                Eq("account_id", ctx.account_id),
+                PathScope("uri", canonical_uri, depth=-1 if recursive else 0),
+                In("level", [0, 1, 2]),
+            ]
+        )
+        expected_count = await self._strict_transfer_count(ctx, scope)
+        if expected_count == 0:
+            return {}
+        page = await self.filter(
+            filter=scope,
+            limit=expected_count,
+            offset=0,
+            output_fields=projection,
+            ctx=ctx,
+        )
+        if len(page) != expected_count:
+            raise RuntimeError(
+                f"Reindex inventory under {canonical_uri} returned {len(page)} "
+                f"records but count was {expected_count}"
+            )
+
+        records: Dict[str, Dict[str, Any]] = {}
+        for record in page:
+            record_id = str(record.get("id") or "")
+            record_uri = str(record.get("uri") or "")
+            try:
+                level = int(record.get("level"))
+            except (TypeError, ValueError):
+                level = -1
+            if (
+                not record_id
+                or level not in {0, 1, 2}
+                or not uri_in_transfer_scope(record_uri, canonical_uri, recursive=recursive)
+            ):
+                raise RuntimeError(
+                    f"Reindex inventory under {canonical_uri} returned an invalid record: "
+                    f"id={record_id or '<missing>'} uri={record_uri or '<missing>'} level={level}"
+                )
+            if record_id in records:
+                raise RuntimeError(f"Reindex inventory returned duplicate record id: {record_id}")
+            records[record_id] = {
+                field: record[field] for field in projection if field in record
+            }
+            records[record_id].update(
+                {
+                    "id": record_id,
+                    "uri": record_uri,
+                    "level": level,
+                    "md5": str(record.get("md5") or ""),
+                }
+            )
+        return records
+
     async def get_incremental_inventory_by_uris(
         self,
         uris: List[str],

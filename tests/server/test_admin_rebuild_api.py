@@ -2091,14 +2091,13 @@ async def test_reindex_file_summary_reads_existing_record_as_uri_owner(monkeypat
 
 
 @pytest.mark.asyncio
-async def test_reindex_memory_fallback_reads_existing_record_as_uri_owner(monkeypatch):
+async def test_reindex_memory_fallback_uses_preloaded_existing_record(monkeypatch):
     from openviking.service.reindex_executor import (
         ReindexExecutor,
         _ReindexCounters,
         _SourceRead,
     )
 
-    captured = {}
     upserts = []
 
     class FakeVikingFS:
@@ -2111,10 +2110,6 @@ async def test_reindex_memory_fallback_reads_existing_record_as_uri_owner(monkey
     async def fake_read_memory_body(self, uri, *, ctx):
         return _SourceRead(exists=True, text="")
 
-    async def fake_fetch_existing_record(self, *, uri, level, ctx):
-        captured["ctx"] = ctx
-        return {"abstract": "owner memory summary"}
-
     async def fake_best_file_summary(self, uri, *, ctx):
         return ""
 
@@ -2123,7 +2118,6 @@ async def test_reindex_memory_fallback_reads_existing_record_as_uri_owner(monkey
 
     monkeypatch.setattr("openviking.service.reindex_executor.get_viking_fs", lambda: FakeVikingFS())
     monkeypatch.setattr(ReindexExecutor, "_read_memory_body", fake_read_memory_body)
-    monkeypatch.setattr(ReindexExecutor, "_fetch_existing_record", fake_fetch_existing_record)
     monkeypatch.setattr(ReindexExecutor, "_best_file_summary", fake_best_file_summary)
     monkeypatch.setattr(ReindexExecutor, "_upsert_context", fake_upsert_context)
 
@@ -2137,10 +2131,219 @@ async def test_reindex_memory_fallback_reads_existing_record_as_uri_owner(monkey
         uri="viking://user/bob/memories/preferences/theme.md",
         counters=_ReindexCounters(),
         ctx=ctx,
+        vector_inventory={
+            "theme-l2": {
+                "id": "theme-l2",
+                "uri": "viking://user/bob/memories/preferences/theme.md",
+                "level": 2,
+                "abstract": "owner memory summary",
+            }
+        },
     )
 
-    assert captured["ctx"].user.user_id == "bob"
     assert upserts[0]["abstract"] == "owner memory summary"
+
+
+@pytest.mark.asyncio
+async def test_reindex_memory_prefetches_existing_records_once(monkeypatch):
+    from openviking.service.reindex_executor import (
+        ReindexExecutor,
+        _ReindexCounters,
+        _SourceRead,
+    )
+
+    root = "viking://user/bob/memories/preferences"
+    first = f"{root}/first.md"
+    second = f"{root}/second.md"
+
+    class FakeVikingFS:
+        async def exists(self, uri, ctx=None):
+            return True
+
+        async def stat(self, uri, ctx=None, skip_count=True):
+            return {"isDir": True}
+
+        async def tree(self, uri, **kwargs):
+            assert uri == root
+            return [
+                {"uri": first, "isDir": False},
+                {"uri": second, "isDir": False},
+            ]
+
+    class FakeVikingDB:
+        def __init__(self):
+            self.inventory_calls = 0
+
+        async def get_reindex_inventory_under_uri(
+            self, uri, *, ctx, output_fields, recursive=True
+        ):
+            self.inventory_calls += 1
+            assert uri == root
+            assert recursive is True
+            assert {"abstract", "context_type", "owner_user_id"} <= set(output_fields)
+            return {
+                "first-l2": {
+                    "id": "first-l2",
+                    "uri": first,
+                    "level": 2,
+                    "abstract": "existing first abstract",
+                },
+                "second-l2": {
+                    "id": "second-l2",
+                    "uri": second,
+                    "level": 2,
+                    "abstract": "existing second abstract",
+                },
+            }
+
+    db = FakeVikingDB()
+    service = SimpleNamespace(vikingdb_manager=db)
+    upserts = {}
+
+    async def fake_directory_chain(self, **kwargs):
+        return None
+
+    async def fake_read_memory_body(self, uri, *, ctx):
+        return _SourceRead(exists=True, text=f"body for {uri}")
+
+    async def fail_per_file_lookup(self, *, uri, level, ctx):
+        raise AssertionError(f"unexpected per-file V lookup: {uri} level={level}")
+
+    async def fake_safe_read_text(self, uri, *, ctx):
+        return ""
+
+    async def fake_upsert_context(self, **kwargs):
+        upserts[kwargs["uri"]] = kwargs
+
+    monkeypatch.setattr("openviking.service.reindex_executor.get_viking_fs", lambda: FakeVikingFS())
+    monkeypatch.setattr("openviking.service.reindex_executor.get_service", lambda: service)
+    monkeypatch.setattr(ReindexExecutor, "_reindex_memory_directory_chain", fake_directory_chain)
+    monkeypatch.setattr(ReindexExecutor, "_read_memory_body", fake_read_memory_body)
+    monkeypatch.setattr(ReindexExecutor, "_fetch_existing_record", fail_per_file_lookup)
+    monkeypatch.setattr(ReindexExecutor, "_safe_read_text", fake_safe_read_text)
+    monkeypatch.setattr(ReindexExecutor, "_upsert_context", fake_upsert_context)
+
+    ctx = RequestContext(
+        user=UserIdentifier(account_id="test", user_id="admin"),
+        role=Role.ROOT,
+    )
+    await ReindexExecutor()._reindex_memory_vectors(
+        uri=root,
+        counters=_ReindexCounters(),
+        ctx=ctx,
+    )
+
+    assert db.inventory_calls == 1
+    assert upserts[first]["abstract"] == "existing first abstract"
+    assert upserts[second]["abstract"] == "existing second abstract"
+
+
+@pytest.mark.asyncio
+async def test_reindex_memory_inventory_retries_retryable_429(monkeypatch):
+    from openviking.service.reindex_executor import ReindexExecutor, _ReindexCounters
+    from openviking.storage.errors import VikingDBException
+
+    root = "viking://user/bob/memories"
+
+    class FakeVikingFS:
+        async def exists(self, uri, ctx=None):
+            return True
+
+        async def stat(self, uri, ctx=None, skip_count=True):
+            return {"isDir": True}
+
+        async def tree(self, uri, **kwargs):
+            return []
+
+    class FakeVikingDB:
+        def __init__(self):
+            self.calls = 0
+
+        async def get_reindex_inventory_under_uri(self, *args, **kwargs):
+            self.calls += 1
+            if self.calls < 3:
+                raise VikingDBException(
+                    "rate limited",
+                    status_code=429,
+                    retryable=True,
+                )
+            return {}
+
+    db = FakeVikingDB()
+    sleeps = []
+
+    async def fake_sleep(delay):
+        sleeps.append(delay)
+
+    async def fake_directory_chain(self, **kwargs):
+        return None
+
+    monkeypatch.setattr("openviking.service.reindex_executor.get_viking_fs", lambda: FakeVikingFS())
+    monkeypatch.setattr(
+        "openviking.service.reindex_executor.get_service",
+        lambda: SimpleNamespace(vikingdb_manager=db),
+    )
+    monkeypatch.setattr("openviking.service.reindex_executor.asyncio.sleep", fake_sleep)
+    monkeypatch.setattr(ReindexExecutor, "_reindex_memory_directory_chain", fake_directory_chain)
+
+    ctx = RequestContext(
+        user=UserIdentifier(account_id="test", user_id="admin"),
+        role=Role.ROOT,
+    )
+    await ReindexExecutor()._reindex_memory_vectors(
+        uri=root,
+        counters=_ReindexCounters(),
+        ctx=ctx,
+    )
+
+    assert db.calls == 3
+    assert sleeps == [0.25, 1.0]
+
+
+@pytest.mark.asyncio
+async def test_reindex_memory_inventory_failure_happens_before_directory_mutation(monkeypatch):
+    from openviking.service.reindex_executor import ReindexExecutor, _ReindexCounters
+    from openviking.storage.errors import VikingDBException
+
+    root = "viking://user/bob/memories"
+    directory_calls = []
+
+    class FakeVikingFS:
+        async def exists(self, uri, ctx=None):
+            return True
+
+        async def stat(self, uri, ctx=None, skip_count=True):
+            return {"isDir": True}
+
+        async def tree(self, uri, **kwargs):
+            return []
+
+    class FakeVikingDB:
+        async def get_reindex_inventory_under_uri(self, *args, **kwargs):
+            raise VikingDBException("unavailable", status_code=503, retryable=False)
+
+    async def fake_directory_chain(self, **kwargs):
+        directory_calls.append(kwargs)
+
+    monkeypatch.setattr("openviking.service.reindex_executor.get_viking_fs", lambda: FakeVikingFS())
+    monkeypatch.setattr(
+        "openviking.service.reindex_executor.get_service",
+        lambda: SimpleNamespace(vikingdb_manager=FakeVikingDB()),
+    )
+    monkeypatch.setattr(ReindexExecutor, "_reindex_memory_directory_chain", fake_directory_chain)
+
+    ctx = RequestContext(
+        user=UserIdentifier(account_id="test", user_id="admin"),
+        role=Role.ROOT,
+    )
+    with pytest.raises(VikingDBException, match="unavailable"):
+        await ReindexExecutor()._reindex_memory_vectors(
+            uri=root,
+            counters=_ReindexCounters(),
+            ctx=ctx,
+        )
+
+    assert directory_calls == []
 
 
 @pytest.mark.asyncio
@@ -2184,6 +2387,7 @@ async def test_reindex_memory_skips_fallback_when_body_read_fails(monkeypatch):
         uri="viking://user/default/memories/events/item.md",
         counters=counters,
         ctx=ctx,
+        vector_inventory={},
     )
 
     assert upserts == []
@@ -2266,6 +2470,7 @@ async def test_reindex_memory_l2_falls_back_to_body_when_abstract_missing(monkey
         uri="viking://user/default/memories/events/item.md",
         counters=counters,
         ctx=ctx,
+        vector_inventory={},
     )
 
     assert seen["viking://user/default/memories/events/item.md"]["abstract"] == "memory body text"
@@ -2321,6 +2526,7 @@ async def test_reindex_memory_l2_strips_memory_fields_from_abstract(monkeypatch)
         uri="viking://user/default/memories/preferences/food_preference.md",
         counters=counters,
         ctx=ctx,
+        vector_inventory={},
     )
 
     assert (
@@ -2400,6 +2606,7 @@ async def test_reindex_memory_vectors_walks_deep_subtree(monkeypatch):
         uri="viking://user/default/memories/preferences",
         counters=counters,
         ctx=ctx,
+        vector_inventory={},
     )
 
     assert "viking://user/default/memories/preferences/user/food_preference.md" in seen
@@ -2491,6 +2698,7 @@ async def test_reindex_memory_vectors_rebuilds_directory_levels_without_regenera
         uri="viking://user/default/memories/preferences",
         counters=counters,
         ctx=ctx,
+        vector_inventory={},
     )
 
     assert {
