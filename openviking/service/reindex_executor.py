@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
@@ -1498,6 +1499,7 @@ class ReindexExecutor:
                 existing_by_uri_level.setdefault((record_uri, level), dict(record, id=record_id))
 
         overview_cache: dict[str, dict[str, str]] = {}
+        live_chunk_uris: set[str] = set()
 
         async def process_file(file_uri: str) -> _ReindexCounters:
             file_counters = _ReindexCounters(scanned_records=1)
@@ -1509,6 +1511,9 @@ class ReindexExecutor:
                 )
                 return file_counters
             body = body_source.text if body_source.exists else ""
+            if body:
+                for chunk_uri, _chunk in self._chunk_memory_body(file_uri, body):
+                    live_chunk_uris.add(chunk_uri)
             memory_content = MemoryFileUtils.read(body).content if body else ""
             existing = existing_by_uri_level.get((file_uri, int(ContextLevel.DETAIL)))
             abstract = self._best_non_empty(
@@ -1580,6 +1585,69 @@ class ReindexExecutor:
             concurrency=concurrency,
             processor=process_file,
             counters=counters,
+        )
+
+        await self._delete_memory_orphans(
+            root=uri,
+            existing_by_uri_level=existing_by_uri_level,
+            live_file_uris=set(file_uris),
+            live_directory_uris=directory_uris,
+            live_chunk_uris=live_chunk_uris,
+            counters=counters,
+            ctx=ctx,
+        )
+
+    async def _delete_memory_orphans(
+        self,
+        *,
+        root: str,
+        existing_by_uri_level: dict[tuple[str, int], dict[str, Any]],
+        live_file_uris: set[str],
+        live_directory_uris: set[str],
+        live_chunk_uris: set[str],
+        counters: _ReindexCounters,
+        ctx: RequestContext,
+    ) -> None:
+        """Delete memory V records whose formal source no longer exists.
+
+        Covers plain L2 files, directory L0/L1 markers, and virtual
+        ``#chunk_NNNN`` records that the current base body no longer produces.
+        Session URIs and any record outside the memory namespace are never
+        deleted here.
+        """
+        chunk_pattern = re.compile(r"^(?P<base>.+)#chunk_\d{4,}$")
+        orphan_ids: list[str] = []
+        for (record_uri, level), record in existing_by_uri_level.items():
+            if is_session_uri(record_uri) or classify_uri(record_uri).context_type != "memory":
+                continue
+            record_id = str(record.get("id") or "")
+            if not record_id:
+                continue
+            if level in {0, 1}:
+                if record_uri not in live_directory_uris:
+                    orphan_ids.append(record_id)
+                continue
+            # level == 2
+            chunk_match = chunk_pattern.match(record_uri)
+            if chunk_match:
+                base_uri = chunk_match.group("base")
+                # A chunk stays only if its base is live and the current body
+                # still produces this exact chunk URI.
+                if base_uri in live_file_uris and record_uri in live_chunk_uris:
+                    continue
+                orphan_ids.append(record_id)
+                continue
+            if record_uri not in live_file_uris:
+                orphan_ids.append(record_id)
+
+        if not orphan_ids:
+            return
+        service = get_service()
+        if service.vikingdb_manager is None:
+            return
+        owner_ctx = self._content_owner_ctx(root, ctx)
+        counters.deleted_records += await service.vikingdb_manager.strict_delete(
+            orphan_ids, ctx=owner_ctx
         )
 
     async def _read_reindex_inventory(

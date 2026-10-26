@@ -2259,6 +2259,186 @@ async def test_reindex_memory_prefetches_existing_records_once(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_reindex_memory_deletes_orphan_vectors(monkeypatch):
+    from openviking.service.reindex_executor import (
+        ReindexExecutor,
+        _ReindexCounters,
+        _SourceRead,
+    )
+
+    root = "viking://user/bob/memories/preferences"
+    live_file = f"{root}/live.md"
+    gone_file = f"{root}/gone.md"
+    gone_dir = f"{root}/old_dir"
+
+    class FakeVikingFS:
+        async def exists(self, uri, ctx=None):
+            return True
+
+        async def stat(self, uri, ctx=None, skip_count=True):
+            return {"isDir": True}
+
+        async def tree(self, uri, **kwargs):
+            # Only the live file and the root remain on disk.
+            return [
+                {"uri": live_file, "isDir": False},
+            ]
+
+    inventory = {
+        "live-l2": {"id": "live-l2", "uri": live_file, "level": 2},
+        "gone-l2": {"id": "gone-l2", "uri": gone_file, "level": 2},
+        "gone-chunk": {"id": "gone-chunk", "uri": f"{gone_file}#chunk_0000", "level": 2},
+        "gonedir-l0": {"id": "gonedir-l0", "uri": gone_dir, "level": 0},
+        "gonedir-l1": {"id": "gonedir-l1", "uri": gone_dir, "level": 1},
+    }
+
+    deleted: dict[str, list[str]] = {}
+
+    class FakeVikingDB:
+        async def get_reindex_inventory_under_uri(self, uri, *, ctx, output_fields, recursive=True):
+            return inventory
+
+        async def strict_delete(self, ids, *, ctx):
+            deleted["ids"] = list(ids)
+            deleted["user"] = ctx.user.user_id
+            return len(ids)
+
+    async def fake_directory_chain(self, **kwargs):
+        return None
+
+    async def fake_read_memory_body(self, uri, *, ctx):
+        if uri == live_file:
+            return _SourceRead(exists=True, text="live body")
+        return _SourceRead(exists=False)
+
+    async def fake_safe_read_text(self, uri, *, ctx):
+        return ""
+
+    async def fake_upsert_context(self, **kwargs):
+        return None
+
+    monkeypatch.setattr("openviking.service.reindex_executor.get_viking_fs", lambda: FakeVikingFS())
+    monkeypatch.setattr(
+        "openviking.service.reindex_executor.get_service",
+        lambda: SimpleNamespace(vikingdb_manager=FakeVikingDB()),
+    )
+    monkeypatch.setattr(ReindexExecutor, "_reindex_memory_directory_chain", fake_directory_chain)
+    monkeypatch.setattr(ReindexExecutor, "_read_memory_body", fake_read_memory_body)
+    monkeypatch.setattr(ReindexExecutor, "_safe_read_text", fake_safe_read_text)
+    monkeypatch.setattr(ReindexExecutor, "_upsert_context", fake_upsert_context)
+
+    service = ReindexExecutor()
+    counters = _ReindexCounters()
+    ctx = RequestContext(
+        user=UserIdentifier(account_id="test", user_id="admin"),
+        role=Role.ROOT,
+    )
+
+    await service._reindex_memory_vectors(
+        uri=root,
+        counters=counters,
+        ctx=ctx,
+    )
+
+    assert set(deleted["ids"]) == {"gone-l2", "gone-chunk", "gonedir-l0", "gonedir-l1"}
+    assert deleted["user"] == "bob"
+    assert counters.deleted_records == 4
+
+
+@pytest.mark.asyncio
+async def test_reindex_memory_keeps_live_chunks_and_excludes_sessions(monkeypatch):
+    from openviking.service.reindex_executor import (
+        ReindexExecutor,
+        _ReindexCounters,
+        _SourceRead,
+    )
+
+    root = "viking://user/bob/memories/events"
+    base_file = f"{root}/2026/report.md"
+
+    class FakeVikingFS:
+        async def exists(self, uri, ctx=None):
+            return True
+
+        async def stat(self, uri, ctx=None, skip_count=True):
+            return {"isDir": True}
+
+        async def tree(self, uri, **kwargs):
+            return [
+                {"uri": f"{root}/2026", "isDir": True},
+                {"uri": base_file, "isDir": False},
+            ]
+
+    inventory = {
+        "base-l2": {"id": "base-l2", "uri": base_file, "level": 2},
+        "chunk0": {"id": "chunk0", "uri": f"{base_file}#chunk_0000", "level": 2},
+        "chunk1": {"id": "chunk1", "uri": f"{base_file}#chunk_0001", "level": 2},
+        "stale-chunk": {"id": "stale-chunk", "uri": f"{base_file}#chunk_0002", "level": 2},
+        "session-leak": {
+            "id": "session-leak",
+            "uri": "viking://user/bob/sessions/s1/msg.md",
+            "level": 2,
+        },
+    }
+
+    deleted: dict[str, list[str]] = {}
+
+    class FakeVikingDB:
+        async def get_reindex_inventory_under_uri(self, uri, *, ctx, output_fields, recursive=True):
+            return inventory
+
+        async def strict_delete(self, ids, *, ctx):
+            deleted["ids"] = list(ids)
+            return len(ids)
+
+    async def fake_directory_chain(self, **kwargs):
+        return None
+
+    async def fake_read_memory_body(self, uri, *, ctx):
+        if uri == base_file:
+            return _SourceRead(exists=True, text="body long enough to chunk")
+        return _SourceRead(exists=False)
+
+    async def fake_safe_read_text(self, uri, *, ctx):
+        return ""
+
+    async def fake_upsert_context(self, **kwargs):
+        return None
+
+    def fake_chunk_memory_body(self, uri, body):
+        return [(f"{uri}#chunk_0000", "c0"), (f"{uri}#chunk_0001", "c1")]
+
+    monkeypatch.setattr("openviking.service.reindex_executor.get_viking_fs", lambda: FakeVikingFS())
+    monkeypatch.setattr(
+        "openviking.service.reindex_executor.get_service",
+        lambda: SimpleNamespace(vikingdb_manager=FakeVikingDB()),
+    )
+    monkeypatch.setattr(ReindexExecutor, "_reindex_memory_directory_chain", fake_directory_chain)
+    monkeypatch.setattr(ReindexExecutor, "_read_memory_body", fake_read_memory_body)
+    monkeypatch.setattr(ReindexExecutor, "_safe_read_text", fake_safe_read_text)
+    monkeypatch.setattr(ReindexExecutor, "_upsert_context", fake_upsert_context)
+    monkeypatch.setattr(ReindexExecutor, "_chunk_memory_body", fake_chunk_memory_body)
+
+    service = ReindexExecutor()
+    counters = _ReindexCounters()
+    ctx = RequestContext(
+        user=UserIdentifier(account_id="test", user_id="admin"),
+        role=Role.ROOT,
+    )
+
+    await service._reindex_memory_vectors(
+        uri=root,
+        counters=counters,
+        ctx=ctx,
+    )
+
+    # Only the stale chunk is an orphan; live base + its two current chunks stay,
+    # and the session-scoped leak is never deleted by a memory reindex.
+    assert deleted["ids"] == ["stale-chunk"]
+    assert counters.deleted_records == 1
+
+
+@pytest.mark.asyncio
 async def test_reindex_memory_inventory_retries_retryable_429(monkeypatch):
     from openviking.service.reindex_executor import ReindexExecutor, _ReindexCounters
     from openviking.storage.errors import VikingDBException
