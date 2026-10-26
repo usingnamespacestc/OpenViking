@@ -1347,6 +1347,78 @@ class ReindexExecutor:
                     root_exists=False,
                 )
 
+        await self._cleanup_vector_only_peers(
+            base=base,
+            mode=mode,
+            run=run,
+            owner_ctx=owner_ctx,
+        )
+
+    async def _cleanup_vector_only_peers(
+        self,
+        *,
+        base: str,
+        mode: str,
+        run: _ReindexRunContext,
+        owner_ctx: RequestContext,
+    ) -> None:
+        """Delete V records for peer content whose formal roots are gone.
+
+        A peer's ``resources`` subtree is reindexed as a missing RFV root so its
+        orphan vectors are removed, while peer ``memories`` records are deleted
+        directly (memory uses its own chunk/level-aware diff, not RFV).
+        """
+        service = get_service()
+        if service.vikingdb_manager is None:
+            return
+        peers_prefix = f"{base}/peers"
+        peers_inventory = await self._read_reindex_inventory(
+            service.vikingdb_manager,
+            uri=peers_prefix,
+            ctx=owner_ctx,
+            recursive=True,
+        )
+        if not peers_inventory:
+            return
+
+        viking_fs = get_viking_fs()
+        resource_roots: set[str] = set()
+        memory_orphan_ids: list[str] = []
+        for record in peers_inventory.values():
+            record_uri = str(record.get("uri") or "")
+            classification = classify_uri(record_uri)
+            if classification.content_index is None:
+                continue
+            content_root = "viking://" + "/".join(
+                classification.parts[: classification.content_index + 1]
+            )
+            if classification.is_memory:
+                memory_orphan_ids.append(str(record.get("id") or ""))
+            elif classification.context_type == "resource":
+                resource_roots.add(content_root)
+
+        for resource_root in sorted(resource_roots):
+            if await viking_fs.exists(resource_root, ctx=owner_ctx):
+                # Live peer resource roots are reindexed by the formal pass of a
+                # direct/peer-scoped request; skip here to avoid double work.
+                continue
+            await self._reindex_rfv(
+                uri=resource_root,
+                mode=mode,
+                context_type="resource",
+                recursive=True,
+                run=run,
+                root_is_dir=True,
+                formal_entries=[],
+                root_exists=False,
+            )
+
+        memory_orphan_ids = [record_id for record_id in memory_orphan_ids if record_id]
+        if memory_orphan_ids:
+            run.counters.deleted_records += await service.vikingdb_manager.strict_delete(
+                memory_orphan_ids, ctx=owner_ctx
+            )
+
     async def _reindex_global_namespace(
         self,
         *,

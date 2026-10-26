@@ -2975,6 +2975,87 @@ async def test_reindex_user_namespace_partitions_memory_skill_and_resource(monke
 
 
 @pytest.mark.asyncio
+async def test_reindex_user_namespace_cleans_vector_only_peer_roots(monkeypatch):
+    from openviking.service.reindex_executor import ReindexExecutor, _ReindexCounters
+
+    user_root = "viking://user/bob"
+
+    class FakeVikingFS:
+        async def tree(self, uri, **kwargs):
+            # No live peer content on disk; everything under peers is V-only.
+            return []
+
+        async def exists(self, uri, ctx=None):
+            return False
+
+    peers_prefix = f"{user_root}/peers"
+    peers_inventory = {
+        "peer-res-l2": {
+            "id": "peer-res-l2",
+            "uri": f"{peers_prefix}/alice/resources/doc.md",
+            "level": 2,
+        },
+        "peer-mem-l2": {
+            "id": "peer-mem-l2",
+            "uri": f"{peers_prefix}/alice/memories/profile.md",
+            "level": 2,
+        },
+        "peer-mem-l0": {
+            "id": "peer-mem-l0",
+            "uri": f"{peers_prefix}/alice/memories/preferences",
+            "level": 0,
+        },
+    }
+
+    deleted: dict[str, list[str]] = {}
+
+    class FakeVikingDB:
+        async def get_reindex_inventory_under_uri(self, uri, *, ctx, output_fields, recursive=True):
+            if uri.rstrip("/") == peers_prefix:
+                return peers_inventory
+            return {}
+
+        async def strict_delete(self, ids, *, ctx):
+            deleted.setdefault("ids", []).extend(ids)
+            return len(ids)
+
+    rfv_calls = []
+
+    async def fake_reindex_rfv(self, **kwargs):
+        rfv_calls.append(kwargs)
+
+    monkeypatch.setattr("openviking.service.reindex_executor.get_viking_fs", lambda: FakeVikingFS())
+    monkeypatch.setattr(
+        "openviking.service.reindex_executor.get_service",
+        lambda: SimpleNamespace(vikingdb_manager=FakeVikingDB()),
+    )
+    monkeypatch.setattr(ReindexExecutor, "_reindex_rfv", fake_reindex_rfv)
+
+    service = ReindexExecutor()
+    counters = _ReindexCounters()
+    ctx = RequestContext(
+        user=UserIdentifier(account_id="test", user_id="bob"),
+        role=Role.ROOT,
+    )
+
+    await service._reindex_user_namespace(
+        uri=user_root,
+        mode="vectors_only",
+        run=_make_reindex_run(ctx, counters),
+    )
+
+    # Ghost peer resources root reindexed as missing so RFV deletes its vectors.
+    ghost_resource = next(
+        call
+        for call in rfv_calls
+        if call["uri"] == f"{peers_prefix}/alice/resources"
+    )
+    assert ghost_resource["root_exists"] is False
+    # Ghost peer memory records are deleted directly.
+    assert set(deleted["ids"]) == {"peer-mem-l2", "peer-mem-l0"}
+
+
+@pytest.mark.asyncio
 async def test_reindex_user_namespace_deletes_vector_only_skill_and_resource_roots(monkeypatch):
     from openviking.service.reindex_executor import ReindexExecutor, _ReindexCounters
 
