@@ -43,6 +43,14 @@ def _make_reindex_run(ctx, counters):
     return _ReindexRunContext(ctx=ctx, counters=counters)
 
 
+class _EmptyInventoryDB:
+    """Namespace vector backend that reports no vector-only orphan roots."""
+
+    async def get_reindex_inventory_under_uri(self, uri, *, ctx, output_fields, recursive=True):
+        del uri, ctx, output_fields, recursive
+        return {}
+
+
 async def test_reindex_requires_admin_role(admin_client: httpx.AsyncClient):
     resp = await admin_client.post(
         "/api/v1/content/reindex",
@@ -1523,6 +1531,10 @@ async def test_reindex_user_namespace_semantic_and_vectors_promotes_memory_mode(
         seen["rfv_calls"].append(kwargs)
 
     monkeypatch.setattr("openviking.service.reindex_executor.get_viking_fs", lambda: FakeVikingFS())
+    monkeypatch.setattr(
+        "openviking.service.reindex_executor.get_service",
+        lambda: SimpleNamespace(vikingdb_manager=_EmptyInventoryDB()),
+    )
     monkeypatch.setattr(ReindexExecutor, "_reindex_memory", fake_reindex_memory)
     monkeypatch.setattr(ReindexExecutor, "_reindex_rfv", fake_reindex_rfv)
 
@@ -1574,6 +1586,10 @@ async def test_reindex_user_namespace_semantic_and_vectors_does_not_reprocess_me
         seen["rfv_calls"].append(kwargs)
 
     monkeypatch.setattr("openviking.service.reindex_executor.get_viking_fs", lambda: FakeVikingFS())
+    monkeypatch.setattr(
+        "openviking.service.reindex_executor.get_service",
+        lambda: SimpleNamespace(vikingdb_manager=_EmptyInventoryDB()),
+    )
     monkeypatch.setattr(ReindexExecutor, "_reindex_memory", fake_reindex_memory)
     monkeypatch.setattr(ReindexExecutor, "_reindex_rfv", fake_reindex_rfv)
 
@@ -1622,6 +1638,10 @@ async def test_reindex_user_namespace_semantic_and_vectors_skips_uncovered_root_
         seen["rfv_calls"].append(kwargs)
 
     monkeypatch.setattr("openviking.service.reindex_executor.get_viking_fs", lambda: FakeVikingFS())
+    monkeypatch.setattr(
+        "openviking.service.reindex_executor.get_service",
+        lambda: SimpleNamespace(vikingdb_manager=_EmptyInventoryDB()),
+    )
     monkeypatch.setattr(ReindexExecutor, "_reindex_rfv", fake_reindex_rfv)
 
     service = ReindexExecutor()
@@ -2772,6 +2792,85 @@ async def test_reindex_user_namespace_partitions_memory_skill_and_resource(monke
         ("viking://user/default/resources", "resource"),
         ("viking://user/default/profile.md", "resource"),
     ]
+
+
+@pytest.mark.asyncio
+async def test_reindex_user_namespace_deletes_vector_only_skill_and_resource_roots(monkeypatch):
+    from openviking.service.reindex_executor import ReindexExecutor, _ReindexCounters
+
+    class FakeVikingFS:
+        async def tree(self, uri, **kwargs):
+            # Formal tree only has a live skill; the ghost skill and the whole
+            # resources root are gone from disk but still present in V.
+            return [
+                {"uri": "viking://user/default/skills", "isDir": True},
+                {"uri": "viking://user/default/skills/live_skill", "isDir": True},
+                {"uri": "viking://user/default/skills/live_skill/SKILL.md", "isDir": False},
+            ]
+
+    class FakeVikingDB:
+        async def get_reindex_inventory_under_uri(self, uri, *, ctx, output_fields, recursive=True):
+            prefixes = {
+                "viking://user/default/skills": {
+                    "ghost-l0": {
+                        "id": "ghost-l0",
+                        "uri": "viking://user/default/skills/ghost_skill",
+                        "level": 0,
+                    },
+                    "ghost-l2": {
+                        "id": "ghost-l2",
+                        "uri": "viking://user/default/skills/ghost_skill/SKILL.md",
+                        "level": 2,
+                    },
+                    "live-l2": {
+                        "id": "live-l2",
+                        "uri": "viking://user/default/skills/live_skill/SKILL.md",
+                        "level": 2,
+                    },
+                },
+                "viking://user/default/resources": {
+                    "res-l2": {
+                        "id": "res-l2",
+                        "uri": "viking://user/default/resources/old.md",
+                        "level": 2,
+                    },
+                },
+            }
+            return prefixes.get(uri.rstrip("/"), {})
+
+    seen = {"rfv": []}
+
+    async def fake_reindex_rfv(self, **kwargs):
+        seen["rfv"].append(kwargs)
+
+    monkeypatch.setattr("openviking.service.reindex_executor.get_viking_fs", lambda: FakeVikingFS())
+    monkeypatch.setattr(
+        "openviking.service.reindex_executor.get_service",
+        lambda: SimpleNamespace(vikingdb_manager=FakeVikingDB()),
+    )
+    monkeypatch.setattr(ReindexExecutor, "_reindex_rfv", fake_reindex_rfv)
+
+    service = ReindexExecutor()
+    counters = _ReindexCounters()
+    ctx = RequestContext(
+        user=UserIdentifier(account_id="test", user_id="default"),
+        role=Role.ROOT,
+    )
+
+    await service._reindex_user_namespace(
+        uri="viking://user/default",
+        mode="vectors_only",
+        run=_make_reindex_run(ctx, counters),
+    )
+
+    by_uri = {call["uri"]: call for call in seen["rfv"]}
+    # Live skill still runs with its formal entries.
+    assert by_uri["viking://user/default/skills/live_skill"].get("root_exists", True) is True
+    # The ghost skill root has no formal node; it must be reindexed as a missing
+    # root so its V-only records resolve to orphans and get deleted.
+    assert by_uri["viking://user/default/skills/ghost_skill"]["root_exists"] is False
+    # The resources root disappeared entirely but has V records.
+    assert by_uri["viking://user/default/resources"]["root_exists"] is False
 
 
 @pytest.mark.asyncio

@@ -759,6 +759,7 @@ class ReindexExecutor:
         run: _ReindexRunContext,
         root_is_dir: bool | None = None,
         formal_entries: list[dict[str, Any]] | None = None,
+        root_exists: bool = True,
     ) -> None:
         from openviking.storage.context_update_plan import build_rfv_context_update_plan
         from openviking.storage.resource_rfv import build_rfv_snapshot
@@ -792,6 +793,7 @@ class ReindexExecutor:
                 if formal_entries is not None
                 else None
             ),
+            root_exists=root_exists,
         )
         diff, plan = build_rfv_context_update_plan(
             snapshot=snapshot,
@@ -799,9 +801,11 @@ class ReindexExecutor:
             account_id=run.ctx.account_id,
             source_metadata=snapshot.source_metadata,
         )
+        root_entry = snapshot.formal.entries.get("")
         if (
             mode == "vectors_only"
-            and not snapshot.formal.entries[""].is_dir
+            and root_entry is not None
+            and not root_entry.is_dir
             and any(
                 action.level == int(ContextLevel.DETAIL)
                 and action.action.value in {"merge", "upsert"}
@@ -1257,6 +1261,90 @@ class ReindexExecutor:
                 root_is_dir=False,
                 formal_entries=[],
             )
+
+        if classify_uri(target_root).is_user_namespace_root:
+            await self._reindex_vector_only_roots(
+                user_root=target_root,
+                mode=mode,
+                run=run,
+                live_skill_roots=set(skill_roots),
+                live_resource_roots=set(resource_roots),
+            )
+
+    async def _reindex_vector_only_roots(
+        self,
+        *,
+        user_root: str,
+        mode: str,
+        run: _ReindexRunContext,
+        live_skill_roots: set[str],
+        live_resource_roots: set[str],
+    ) -> None:
+        """Delete V records whose entire skill/resource root vanished from F.
+
+        The formal-tree pass only reindexes roots that still exist on disk, so a
+        skill package or ``resources`` root removed outside the normal APIs would
+        otherwise keep orphan vectors forever. Discover those roots from a scoped V
+        inventory and reindex each with ``root_exists=False`` so RFV deletes them.
+        """
+        base = user_root.rstrip("/")
+        service = get_service()
+        if service.vikingdb_manager is None:
+            return
+        owner_ctx = self._content_owner_ctx(base, run.ctx)
+
+        skills_prefix = f"{base}/skills"
+        skills_inventory = await self._read_reindex_inventory(
+            service.vikingdb_manager,
+            uri=skills_prefix,
+            ctx=owner_ctx,
+            recursive=True,
+        )
+        ghost_skill_roots: set[str] = set()
+        for record in skills_inventory.values():
+            record_uri = str(record.get("uri") or "")
+            classification = classify_uri(record_uri)
+            if classification.content_index is None or not classification.is_skill:
+                continue
+            package_root = "viking://" + "/".join(
+                classification.parts[: classification.content_index + 2]
+            )
+            if (
+                len(classification.parts) >= classification.content_index + 2
+                and package_root not in live_skill_roots
+            ):
+                ghost_skill_roots.add(package_root)
+        for skill_root in sorted(ghost_skill_roots):
+            await self._reindex_rfv(
+                uri=skill_root,
+                mode=mode,
+                context_type="skill",
+                recursive=True,
+                run=run,
+                root_is_dir=True,
+                formal_entries=[],
+                root_exists=False,
+            )
+
+        resources_root = f"{base}/resources"
+        if resources_root not in live_resource_roots:
+            resources_inventory = await self._read_reindex_inventory(
+                service.vikingdb_manager,
+                uri=resources_root,
+                ctx=owner_ctx,
+                recursive=True,
+            )
+            if resources_inventory:
+                await self._reindex_rfv(
+                    uri=resources_root,
+                    mode=mode,
+                    context_type="resource",
+                    recursive=True,
+                    run=run,
+                    root_is_dir=True,
+                    formal_entries=[],
+                    root_exists=False,
+                )
 
     async def _reindex_global_namespace(
         self,
