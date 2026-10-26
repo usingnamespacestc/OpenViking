@@ -91,8 +91,15 @@ async def build_rfv_snapshot(
     source_read_concurrency: int = 8,
     root_is_dir: bool | None = None,
     formal_inventory: tuple[bool, list[Mapping[str, Any]], bool] | None = None,
+    root_exists: bool = True,
 ) -> RFVSnapshot:
-    """Read one complete F/V inventory and each selected embedding source once."""
+    """Read one complete F/V inventory and each selected embedding source once.
+
+    ``root_exists=False`` means the target root is already absent from the formal
+    tree (for example, an entire ``resources`` or skill package removed outside the
+    normal APIs). No formal node is synthesized for it, so every vector record under
+    the root resolves to an orphan and is deleted during the same reindex.
+    """
     root = target_uri.rstrip("/")
     projection = request_intent.required_vector_fields() | {"abstract"}
     if target_uri.rstrip("/").startswith(("viking://user/", "viking://agent/skills/")):
@@ -158,7 +165,9 @@ async def build_rfv_snapshot(
     if not complete:
         raise ValueError("cannot build RFV snapshot from an incomplete formal tree")
 
-    nodes: dict[str, tuple[str, bool]] = {"": (root, root_is_dir)}
+    nodes: dict[str, tuple[str, bool]] = (
+        {"": (root, root_is_dir)} if root_exists else {}
+    )
     sidecars: dict[tuple[str, int], str] = {}
     source_metadata_uri: str | None = None
     for raw in raw_entries:
@@ -185,7 +194,7 @@ async def build_rfv_snapshot(
             continue
         nodes[relative_path] = (uri, bool(raw.get("isDir")))
 
-    if root_is_dir and not recursive:
+    if root_exists and root_is_dir and not recursive:
         for level, name in ((0, ".abstract.md"), (1, ".overview.md")):
             sidecars[("", level)] = f"{root}/{name}"
 

@@ -552,6 +552,64 @@ async def test_build_rfv_snapshot_reads_one_f_inventory_one_v_inventory_and_each
 
 
 @pytest.mark.asyncio
+async def test_build_rfv_snapshot_missing_root_marks_all_vectors_orphan():
+    from openviking.storage.context_update_plan import (
+        IndexAction,
+        build_rfv_context_update_plan,
+    )
+    from openviking.storage.resource_rfv import build_rfv_snapshot
+
+    root = "viking://user/alice/skills/ghost"
+    fs = SimpleNamespace(
+        stat=AsyncMock(side_effect=AssertionError("missing root must not stat")),
+        tree=AsyncMock(side_effect=AssertionError("missing root must not tree")),
+        read_file_bytes=AsyncMock(side_effect=AssertionError("missing root reads nothing")),
+    )
+    db = SimpleNamespace(
+        get_incremental_inventory_under_uri=AsyncMock(
+            return_value={
+                "root-l0": {"id": "root-l0", "uri": root, "level": 0, "md5": "m0"},
+                "root-l1": {"id": "root-l1", "uri": root, "level": 1, "md5": "m1"},
+                "skill-l2": {
+                    "id": "skill-l2",
+                    "uri": f"{root}/SKILL.md",
+                    "level": 2,
+                    "md5": "m2",
+                },
+            }
+        )
+    )
+
+    snapshot = await build_rfv_snapshot(
+        viking_fs=fs,
+        vikingdb=db,
+        target_uri=root,
+        ctx=object(),
+        request_intent=RequestIntent(root, "vectors_only"),
+        recursive=True,
+        formal_inventory=(True, [], True),
+        root_exists=False,
+    )
+
+    assert snapshot.formal.entries == {}
+    _, plan = build_rfv_context_update_plan(
+        snapshot=snapshot,
+        context_type="skill",
+        account_id="acc",
+    )
+    deleted = {
+        (action.uri, action.level)
+        for action in plan.direct_index_actions
+        if action.action is IndexAction.DELETE
+    }
+    assert deleted == {
+        (root, 0),
+        (root, 1),
+        (f"{root}/SKILL.md", 2),
+    }
+
+
+@pytest.mark.asyncio
 async def test_build_rfv_snapshot_non_recursive_directory_reads_only_direct_children():
     from openviking.storage.resource_rfv import build_rfv_snapshot
 
