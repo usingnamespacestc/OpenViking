@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import threading
 import uuid
 from contextlib import asynccontextmanager
@@ -2370,6 +2371,7 @@ class VikingVectorIndexBackend:
         output_fields: Optional[List[str]] = None,
         recursive: bool = True,
         include_direct_children: bool = False,
+        include_virtual_chunks: bool = False,
     ) -> Dict[str, Dict[str, Any]]:
         """Load one complete lightweight reindex inventory without page-level planning."""
         projection = list(
@@ -2381,12 +2383,18 @@ class VikingVectorIndexBackend:
             )
         )
         canonical_uri = resolve_uri(uri).uri.rstrip("/")
-        root_parts = uri_parts(canonical_uri)
         depth = -1 if recursive else 1 if include_direct_children else 0
+        if include_virtual_chunks and depth != 0:
+            raise ValueError("virtual chunk inventory requires an exact file scope")
+        # Path-index queries are portable; some VikingDB services reject string prefixes.
+        inventory_uri = canonical_uri.rsplit("/", 1)[0] if include_virtual_chunks else canonical_uri
+        inventory_depth = 1 if include_virtual_chunks else depth
+        root_parts = uri_parts(inventory_uri)
+        chunk_prefix = canonical_uri + "#chunk_"
         scope = And(
             [
                 Eq("account_id", ctx.account_id),
-                PathScope("uri", canonical_uri, depth=depth),
+                PathScope("uri", inventory_uri, depth=inventory_depth),
                 In("level", [0, 1, 2]),
             ]
         )
@@ -2407,6 +2415,7 @@ class VikingVectorIndexBackend:
             )
 
         records: Dict[str, Dict[str, Any]] = {}
+        seen_ids: set[str] = set()
         for record in page:
             record_id = str(record.get("id") or "")
             record_uri = str(record.get("uri") or "")
@@ -2418,22 +2427,28 @@ class VikingVectorIndexBackend:
                 level = int(record.get("level"))
             except (TypeError, ValueError):
                 level = -1
+            is_chunk = (
+                include_virtual_chunks
+                and level == 2
+                and re.fullmatch(re.escape(chunk_prefix) + r"[0-9]{4,}", record_uri) is not None
+            )
             if (
                 not record_id
                 or level not in {0, 1, 2}
                 or record_parts is None
                 or record_parts[: len(root_parts)] != root_parts
-                or (depth >= 0 and len(record_parts) - len(root_parts) > depth)
+                or (inventory_depth >= 0 and len(record_parts) - len(root_parts) > inventory_depth)
             ):
                 raise RuntimeError(
                     f"Reindex inventory under {canonical_uri} returned an invalid record: "
                     f"id={record_id or '<missing>'} uri={record_uri or '<missing>'} level={level}"
                 )
-            if record_id in records:
+            if record_id in seen_ids:
                 raise RuntimeError(f"Reindex inventory returned duplicate record id: {record_id}")
-            records[record_id] = {
-                field: record[field] for field in projection if field in record
-            }
+            seen_ids.add(record_id)
+            if include_virtual_chunks and record_uri != canonical_uri and not is_chunk:
+                continue
+            records[record_id] = {field: record[field] for field in projection if field in record}
             records[record_id].update(
                 {
                     "id": record_id,

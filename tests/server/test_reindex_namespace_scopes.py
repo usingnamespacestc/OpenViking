@@ -122,7 +122,6 @@ def executor_for(monkeypatch, entries, records=None):
     executor._reindex_rfv = AsyncMock()
     executor._upsert_context = AsyncMock()
     executor._effective_file_vectorization_concurrency = lambda: 2
-    executor._chunk_memory_body = lambda uri, body: [(uri + "#chunk_0000", body)]
     ctx = RequestContext(user=UserIdentifier("scopes", "bob"), role=Role.ADMIN)
     run = _ReindexRunContext(ctx=ctx, counters=_ReindexCounters())
     return executor, fs, db, run
@@ -187,12 +186,12 @@ async def test_missing_self_memory_root_deletes_all_physical_ids(monkeypatch, mo
             "chunk": record(root + "/events/a.md#chunk_0000"),
         },
     )
-    executor._run_semantic_processor = AsyncMock()
+    executor._enqueue_reindex_semantic_message = AsyncMock()
     await executor._reindex_user_namespace(uri=USER, mode=mode, run=run)
     assert set(db.deleted) == {"root-l0", "root-l1", "file-a", "file-b", "chunk"}
     assert run.counters.deleted_records == 5
     executor._upsert_context.assert_not_awaited()
-    executor._run_semantic_processor.assert_not_awaited()
+    executor._enqueue_reindex_semantic_message.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -215,8 +214,8 @@ async def test_memory_root_files_and_literal_chunk_names_share_inventory(monkeyp
     )
     await executor._reindex_memory(uri=root, mode="vectors_only", run=run)
     assert len(db.calls) == 1 and db.calls[0][0] == root
-    assert set(db.deleted) == {"gone", "gone-shard"}
-    assert {"profile", "chunk", "literal"} <= set(db.records)
+    assert set(db.deleted) == {"gone", "gone-shard", "chunk"}
+    assert {"profile", "literal"} <= set(db.records)
     assert [uri for op, uri, _ in fs.calls if op == "tree"] == [root + "/events"]
 
 
@@ -235,10 +234,10 @@ async def test_memory_inventory_failure_precedes_semantic_mutation(monkeypatch):
     root = USER + "/memories"
     executor, fs, db, run = executor_for(monkeypatch, {root + "/events/live.md": False})
     db.failure = root
-    executor._run_semantic_processor = AsyncMock()
+    executor._enqueue_reindex_semantic_message = AsyncMock()
     with pytest.raises(RuntimeError, match="Inventory incomplete"):
         await executor._reindex_memory(uri=root, mode="semantic_and_vectors", run=run)
-    executor._run_semantic_processor.assert_not_awaited()
+    executor._enqueue_reindex_semantic_message.assert_not_awaited()
     executor._upsert_context.assert_not_awaited()
     assert not db.deleted
 
@@ -403,17 +402,17 @@ async def test_denied_shallow_listing_blocks_all_user_scope_mutations(monkeypatc
 async def test_direct_memory_root_listing_failure_precedes_semantic_work(monkeypatch):
     root = USER + "/memories"
     executor, fs, db, run = executor_for(monkeypatch, {root + "/events/live.md": False})
-    executor._run_semantic_processor = AsyncMock()
+    executor._enqueue_reindex_semantic_message = AsyncMock()
     fs.fault = ("ls", root)
     with pytest.raises(RuntimeError, match="listing unavailable"):
         await executor._reindex_memory(uri=root, mode="semantic_and_vectors", run=run)
-    executor._run_semantic_processor.assert_not_awaited()
+    executor._enqueue_reindex_semantic_message.assert_not_awaited()
     executor._upsert_context.assert_not_awaited()
     assert not db.deleted
 
 
 @pytest.mark.asyncio
-async def test_live_chunk_is_not_captured_by_same_named_real_directory(monkeypatch):
+async def test_legacy_chunk_is_retired_without_deleting_same_named_real_directory(monkeypatch):
     root = USER + "/memories"
     base, chunk = root + "/profile.md", root + "/profile.md#chunk_0000"
     executor, fs, db, run = executor_for(
@@ -429,9 +428,12 @@ async def test_live_chunk_is_not_captured_by_same_named_real_directory(monkeypat
             "child": record(chunk + "/child.md"),
         },
     )
+    executor._read_memory_directory_source = AsyncMock(
+        return_value=module._SourceRead(exists=True, text="Real directory summary")
+    )
     await executor._reindex_memory(uri=root, mode="vectors_only", run=run)
-    assert not db.deleted, "A real directory cannot displace a virtual L2 chunk's base file"
-    assert {"base", "valid-chunk", "directory-marker", "child"} <= set(db.records)
+    assert db.deleted == ["valid-chunk"]
+    assert {"base", "directory-marker", "child"} <= set(db.records)
 
 
 @pytest.mark.asyncio

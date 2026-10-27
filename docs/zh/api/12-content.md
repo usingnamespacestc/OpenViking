@@ -689,6 +689,12 @@ session 子树会被跳过。
 
 namespace 从 F 条目和 V 记录共同发现动态根，因此可以在父 scope 持锁期间清理已经缺失的 memory 根/shard、skill package 或 peer 内容根。直接请求一个已不存在的目标仍返回 `NOT_FOUND`；应使用仍存在的父内容范围或 namespace 清理其孤儿向量。
 
+memory reindex 按物理 ID 清理全部孤儿记录。memory 向量化使用原文件的 L2，已不再生成虚拟 `#chunk_NNNN` 记录。reindex 清理这些已停用的历史记录，显式文件请求也覆盖自身旧 chunks，base 文件处理失败也不影响旧 chunks 的清理。base 文件失败单独报告并保留其已有 L2；名称恰好类似 chunk URI 的真实文件仍受到保护。
+
+memory 目录 L0/L1 分别要求有效且非空的 `.abstract.md`/`.overview.md` 来源。确认来源缺失或为空时删除该 level 的旧记录；IO 或格式错误时保留旧记录，增加 `failed_records` 并报告 warning。另一 level 与健康文件继续处理。
+
+`semantic_and_vectors` 模式中，memory 先完成孤儿收敛，再把锁交给与 `add_resources` 相同的 Semantic queue。语义生成、文件和目录向量化、重试/重新入队、embedding work 与 TaskTracker 统计都由共享队列负责；reindex 等待这些 child work 完成后再结束。显式文件 reindex 在删除前锁住候选旧 chunk 路径并再次检查 F，保护并发创建的同名真实文件向量；这些额外 exact 锁仅覆盖候选 chunk 路径，并在完成、失败或取消时释放。
+
 **模式说明**
 
 - `vectors_only`：通过 RFV 对比当前 source MD5 与向量记录 MD5，只重建缺失或过期的 L0/L1/L2；不会重写 `.abstract.md` 和 `.overview.md`

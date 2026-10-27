@@ -196,9 +196,8 @@ def memory_scope(monkeypatch):
     monkeypatch.setattr(reindex_module, "get_viking_fs", lambda: fs)
     monkeypatch.setattr(reindex_module, "get_service", lambda: SimpleNamespace(vikingdb_manager=db))
     executor = ReindexExecutor()
-    executor._reindex_memory_directory_chain = AsyncMock()
+    executor._reindex_memory_directory_chain = AsyncMock(return_value={})
     executor._best_memory_file_summary = AsyncMock(return_value="Old summary")
-    executor._chunk_memory_body = lambda uri, body: [(uri + "#chunk_0000", body)]
     executor._upsert_context = AsyncMock()
     executor._effective_file_vectorization_concurrency = lambda: 1
 
@@ -238,7 +237,14 @@ async def test_bad_memory_keeps_old_chunks_and_later_files_converge(memory_scope
     )
     assert counters.failed_records == 1
     assert counters.rebuilt_records == 2
-    assert set(scope.db.strict_delete.await_args.args[0]) == {"healthy-stale", "gone", "gone-c0"}
+    assert set(scope.db.strict_delete.await_args.args[0]) == {
+        "bad-c0",
+        "bad-c42",
+        "healthy-c0",
+        "healthy-stale",
+        "gone",
+        "gone-c0",
+    }
     assert {call.kwargs["uri"] for call in scope.executor._upsert_context.await_args_list} == set(
         scope.files[1:]
     )

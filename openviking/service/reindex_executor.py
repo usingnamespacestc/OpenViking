@@ -64,7 +64,7 @@ from openviking_cli.utils.config import get_openviking_config
 from openviking_cli.utils.config.embedding_config import SUMMARY_TEXT_SOURCES
 
 logger = get_logger(__name__)
-_MEMORY_CHUNK_PATTERN = re.compile(r"^(?P<base>.+)#chunk_\d{4,}$")
+_MEMORY_CHUNK_PATTERN = re.compile(r"^(?P<base>.+)#chunk_[0-9]{4,}$")
 
 REINDEX_TASK_TYPE = "admin_reindex"
 REINDEX_ENQUEUE_ERROR = "Failed to enqueue reindex processing"
@@ -722,6 +722,7 @@ class ReindexExecutor:
         run: _ReindexRunContext,
         children: list[dict[str, Any]],
         inventory: Mapping[str, Mapping[str, Any]],
+        reconcile_only: bool = False,
     ) -> None:
         by_uri = {
             str(entry["uri"]): entry
@@ -778,6 +779,8 @@ class ReindexExecutor:
                     "formal_entries": root_files,
                     "root_is_dir": True,
                     "vector_inventory": root_inventory,
+                    "lease_ref": run.lease,
+                    "reconcile_only": reconcile_only,
                 },
                 run.ingest_options,
             )
@@ -806,60 +809,12 @@ class ReindexExecutor:
                         "root_is_dir": is_dir,
                         "root_exists": root_exists,
                         "vector_inventory": groups.get(root, {}),
+                        "lease_ref": run.lease,
+                        "reconcile_only": reconcile_only,
                     },
                     run.ingest_options,
                 )
             )
-
-    async def _refresh_namespace_resource_semantics(
-        self,
-        *,
-        target_root: str,
-        directories: list[str],
-        files: list[str],
-        run: _ReindexRunContext,
-    ) -> tuple[list[str], list[str]]:
-        counters = run.counters
-        ctx = run.ctx
-        prefix = self._child_prefix(target_root)
-        semantic_roots = sorted(
-            {
-                directory_uri
-                for directory_uri in directories
-                if directory_uri.startswith(prefix)
-                and "/" not in directory_uri[len(prefix) :]
-                and directory_uri[len(prefix) :]
-            }
-        )
-        filtered_directories = [
-            directory_uri
-            for directory_uri in directories
-            if any(
-                directory_uri == root or directory_uri.startswith(root + "/")
-                for root in semantic_roots
-            )
-        ]
-        filtered_files = [
-            file_uri
-            for file_uri in files
-            if any(file_uri.startswith(root + "/") for root in semantic_roots)
-        ]
-        filtered_file_set = set(filtered_files)
-        for file_uri in files:
-            if file_uri in filtered_file_set:
-                continue
-            counters.unsupported_records += 1
-            counters.warnings.append(
-                f"Skipped {file_uri}: namespace semantic_and_vectors only refreshes resource directories"
-            )
-        for semantic_root in semantic_roots:
-            await self._run_semantic_processor(
-                uri=semantic_root,
-                context_type="resource",
-                ctx=ctx,
-                lock=run.lock,
-            )
-        return filtered_directories, filtered_files
 
     @staticmethod
     def _child_prefix(root: str) -> str:
@@ -1237,8 +1192,6 @@ class ReindexExecutor:
         run: _ReindexRunContext,
     ) -> None:
         """Persist one fully planned reindex DAG without persisting its source bytes."""
-        from openviking.storage.queuefs import get_queue_manager
-
         owner_ctx = self._content_owner_ctx(semantic_plan.root_uri, run.ctx)
         telemetry_id = get_current_telemetry().telemetry_id
         msg = SemanticMsg(
@@ -1255,6 +1208,23 @@ class ReindexExecutor:
             propagate_to_parent=recursive,
             plan=semantic_plan,
         )
+        root_entry = next(entry for entry in semantic_plan.tree.entries if not entry.relative_path)
+        await self._enqueue_reindex_semantic_message(
+            msg=msg,
+            root_is_dir=root_entry.kind == "directory",
+            run=run,
+        )
+
+    async def _enqueue_reindex_semantic_message(
+        self,
+        *,
+        msg: SemanticMsg,
+        root_is_dir: bool,
+        run: _ReindexRunContext,
+    ) -> None:
+        """Queue shared semantic/vector work with the current reindex lock."""
+        from openviking.storage.queuefs import get_queue_manager
+
         queue_manager = get_queue_manager()
         semantic_queue = queue_manager.get_queue(queue_manager.SEMANTIC, allow_create=True)
         if run.lease is None:
@@ -1263,22 +1233,13 @@ class ReindexExecutor:
 
         viking_fs = get_service().viking_fs
         agfs = viking_fs._async_agfs
-        use_outer_lease = run.lock_root_uri in {None, semantic_plan.root_uri.rstrip("/")}
+        use_outer_lease = run.lock_root_uri in {None, msg.uri.rstrip("/")}
         plan_lease = run.lease
         acquired_plan_lease = False
         if not use_outer_lease:
-            root_entry = next(
-                entry for entry in semantic_plan.tree.entries if not entry.relative_path
-            )
-            acquire = (
-                agfs.pathlock_acquire_tree
-                if root_entry.kind == "directory"
-                else agfs.pathlock_acquire_exact
-            )
+            acquire = agfs.pathlock_acquire_tree if root_is_dir else agfs.pathlock_acquire_exact
             kwargs = {"owner_lease_ref": run.lease} if run.lease is not None else {}
-            plan_lease = await acquire(
-                viking_fs._uri_to_path(semantic_plan.root_uri, ctx=owner_ctx), **kwargs
-            )
+            plan_lease = await acquire(viking_fs._uri_to_path(msg.uri, ctx=run.ctx), **kwargs)
             acquired_plan_lease = True
         assert plan_lease is not None
         plan_guard = (
@@ -1354,25 +1315,41 @@ class ReindexExecutor:
                 uri=uri,
                 ctx=self._content_owner_ctx(uri, run.ctx),
                 recursive=(bool(root_is_dir) and recursive) or not root_exists,
+                include_virtual_chunks=root_exists and not root_is_dir,
             )
         shard_root = root_exists and root_is_dir and recursive and classify_uri(uri).is_memory_root
         children = formal_entries
         if shard_root and children is None:
             children = await self._list_scope_children(uri, ctx=run.ctx)
-        if mode == "semantic_and_vectors" and root_exists and root_is_dir:
-            semantic_kwargs = {
-                "uri": uri,
-                "context_type": "memory",
-                "ctx": run.ctx,
-                "lock": run.lock,
-            }
-            if not recursive:
-                semantic_kwargs["recursive"] = False
-            await self._run_semantic_processor(**semantic_kwargs)
+        queue_semantics = mode == "semantic_and_vectors" and root_exists and root_is_dir
         if shard_root:
             await self._memory_scopes(
-                uri=uri, run=run, children=children, inventory=vector_inventory
+                uri=uri,
+                run=run,
+                children=children,
+                inventory=vector_inventory,
+                reconcile_only=queue_semantics,
             )
+            if queue_semantics:
+                owner_ctx = self._content_owner_ctx(uri, run.ctx)
+                await self._enqueue_reindex_semantic_message(
+                    msg=SemanticMsg(
+                        uri=uri,
+                        context_type="memory",
+                        recursive=recursive,
+                        account_id=owner_ctx.account_id,
+                        user_id=owner_ctx.user.user_id,
+                        group_ids=list(owner_ctx.group_ids),
+                        peer_id=owner_ctx.user.user_id,
+                        role=str(owner_ctx.role),
+                        telemetry_id=get_current_telemetry().telemetry_id,
+                        generation_trigger="reindex",
+                        use_hierarchical_aggregation=True,
+                        propagate_to_parent=recursive,
+                    ),
+                    root_is_dir=True,
+                    run=run,
+                )
             return
         await self._reindex_memory_vectors(
             **self._with_ingest_options(
@@ -1385,36 +1362,32 @@ class ReindexExecutor:
                     "root_exists": root_exists,
                     "root_is_dir": root_is_dir,
                     "formal_entries": formal_entries,
+                    "lease_ref": run.lease,
+                    "reconcile_only": queue_semantics,
                 },
                 run.ingest_options,
             )
         )
-
-    async def _run_semantic_processor(
-        self,
-        *,
-        uri: str,
-        context_type: str,
-        ctx: RequestContext,
-        lock: dict | None = None,
-        recursive: bool = True,
-    ) -> None:
-        owner_ctx = self._content_owner_ctx(uri, ctx)
-        processor = await self._semantic_processor_for(owner_ctx)
-        msg = SemanticMsg(
-            uri=uri,
-            context_type=context_type,
-            recursive=recursive,
-            account_id=owner_ctx.account_id,
-            user_id=owner_ctx.user.user_id,
-            peer_id=owner_ctx.user.user_id,
-            role=str(ctx.role),
-            skip_vectorization=True,
-            generation_trigger="reindex",
-            use_hierarchical_aggregation=context_type == "memory",
-            propagate_to_parent=recursive,
-        )
-        await processor.on_dequeue({"data": msg.to_json()}, lock=lock)
+        if queue_semantics:
+            owner_ctx = self._content_owner_ctx(uri, run.ctx)
+            await self._enqueue_reindex_semantic_message(
+                msg=SemanticMsg(
+                    uri=uri,
+                    context_type="memory",
+                    recursive=recursive,
+                    account_id=owner_ctx.account_id,
+                    user_id=owner_ctx.user.user_id,
+                    group_ids=list(owner_ctx.group_ids),
+                    peer_id=owner_ctx.user.user_id,
+                    role=str(owner_ctx.role),
+                    telemetry_id=get_current_telemetry().telemetry_id,
+                    generation_trigger="reindex",
+                    use_hierarchical_aggregation=True,
+                    propagate_to_parent=recursive,
+                ),
+                root_is_dir=True,
+                run=run,
+            )
 
     async def reindex_directory_marker(
         self, *, dir_uri: str, level: ContextLevel, ctx: RequestContext
@@ -1618,6 +1591,8 @@ class ReindexExecutor:
         formal_entries: list[dict[str, Any]] | None = None,
         root_is_dir: bool | None = None,
         root_exists: bool = True,
+        lease_ref: dict[str, Any] | None = None,
+        reconcile_only: bool = False,
     ) -> None:
         viking_fs = get_viking_fs()
         if not root_exists:
@@ -1687,21 +1662,50 @@ class ReindexExecutor:
                 uri=uri,
                 ctx=self._content_owner_ctx(uri, ctx),
                 recursive=root_is_dir and recursive,
+                include_virtual_chunks=not root_is_dir,
             )
         else:
             inventory = dict(vector_inventory)
 
+        if not root_is_dir:
+            for chunk_uri in sorted(
+                {str(record.get("uri") or "") for record in inventory.values()}
+            ):
+                if not re.fullmatch(re.escape(uri) + r"#chunk_[0-9]{4,}", chunk_uri):
+                    continue
+                try:
+                    chunk_stat = await viking_fs.stat(chunk_uri, ctx=ctx, skip_count=True)
+                except NotFoundError:
+                    continue
+                if chunk_stat.get("access") == "denied":
+                    raise PermissionDeniedError(f"Cannot confirm memory chunk source: {chunk_uri}")
+                if not chunk_stat.get("isDir", chunk_stat.get("is_dir")):
+                    file_uris.append(chunk_uri)
+
+        directory_sources: dict[tuple[str, int], _SourceRead] = {}
         if root_is_dir and directory_uris:
-            await self._reindex_memory_directory_chain(
-                **self._with_ingest_options(
-                    {
-                        "directory_uris": sorted(directory_uris),
-                        "counters": counters,
-                        "ctx": ctx,
-                    },
-                    ingest_options,
+            if not reconcile_only:
+                directory_sources = (
+                    await self._reindex_memory_directory_chain(
+                        **self._with_ingest_options(
+                            {
+                                "directory_uris": sorted(directory_uris),
+                                "counters": counters,
+                                "ctx": ctx,
+                            },
+                            ingest_options,
+                        )
+                    )
+                    or {}
                 )
-            )
+            else:
+                for directory_uri in directory_uris:
+                    for level, filename in ((0, ".abstract.md"), (1, ".overview.md")):
+                        directory_sources[
+                            (directory_uri, level)
+                        ] = await self._read_memory_directory_source(
+                            directory_uri + "/" + filename, ctx=ctx
+                        )
         existing_by_uri_level: dict[tuple[str, int], dict[str, Any]] = {}
         for record_id, record in sorted(inventory.items()):
             record_uri = str(record.get("uri") or "")
@@ -1712,9 +1716,11 @@ class ReindexExecutor:
             if record_uri and level in {0, 1, 2}:
                 existing_by_uri_level.setdefault((record_uri, level), dict(record, id=record_id))
 
-        overview_cache: dict[str, dict[str, str]] = {}
-        live_chunk_uris: set[str] = set()
-        unreadable_file_uris: set[str] = set()
+        overview_cache: dict[str, dict[str, str]] = {
+            directory: SemanticProcessor._parse_overview_md(source.text) if source.text else {}
+            for (directory, level), source in directory_sources.items()
+            if level == 1
+        }
 
         async def process_file(file_uri: str) -> _ReindexCounters:
             file_counters = _ReindexCounters(scanned_records=1)
@@ -1726,9 +1732,6 @@ class ReindexExecutor:
                 failure_message = f"Failed to reindex {file_uri} vector"
                 body = body_source.text if body_source.exists else ""
                 memory_content = MemoryFileUtils.read(body).content if body else ""
-                if body:
-                    for chunk_uri, _chunk in self._chunk_memory_body(file_uri, body):
-                        live_chunk_uris.add(chunk_uri)
                 existing = existing_by_uri_level.get((file_uri, int(ContextLevel.DETAIL)))
                 abstract = self._best_non_empty(
                     self._record_abstract(existing),
@@ -1744,7 +1747,7 @@ class ReindexExecutor:
                     file_counters.warnings.append(f"No memory source found for {file_uri}")
                     return file_counters
 
-                parent_uri = VikingURI(file_uri.split("#", 1)[0]).parent.uri
+                parent_uri = VikingURI(file_uri).parent.uri
                 detail_abstract = (
                     self._prefer_non_empty(abstract, memory_content, body) if body else abstract
                 )
@@ -1767,8 +1770,6 @@ class ReindexExecutor:
             except (asyncio.CancelledError, LockError):
                 raise
             except Exception as exc:
-                # Failed preparation or enqueue cannot justify removing old chunks.
-                unreadable_file_uris.add(file_uri)
                 file_counters.failed_records += 1
                 file_counters.warnings.append(f"{failure_message}: {exc}")
             return file_counters
@@ -1781,69 +1782,74 @@ class ReindexExecutor:
                 len(file_uris),
                 concurrency,
             )
-        await self._run_ordered_counter_batches(
-            file_uris,
-            concurrency=concurrency,
-            processor=process_file,
-            counters=counters,
-        )
+        if reconcile_only:
+            counters.scanned_records += len(file_uris) + len(directory_uris)
+        else:
+            await self._run_ordered_counter_batches(
+                [file_uri for file_uri in file_uris if root_is_dir or file_uri == uri],
+                concurrency=concurrency,
+                processor=process_file,
+                counters=counters,
+            )
 
         await self._delete_memory_orphans(
             root=uri,
-            existing_by_uri_level=existing_by_uri_level,
+            vector_inventory=inventory,
             live_file_uris=set(file_uris),
             live_directory_uris=directory_uris,
-            live_chunk_uris=live_chunk_uris,
-            unreadable_file_uris=unreadable_file_uris,
+            live_directory_sources={
+                key for key, source in directory_sources.items() if source.text or source.error
+            },
             counters=counters,
             ctx=ctx,
+            file_scope=not root_is_dir,
+            lease_ref=lease_ref,
         )
 
     async def _delete_memory_orphans(
         self,
         *,
         root: str,
-        existing_by_uri_level: dict[tuple[str, int], dict[str, Any]],
+        vector_inventory: Mapping[str, Mapping[str, Any]],
         live_file_uris: set[str],
         live_directory_uris: set[str],
-        live_chunk_uris: set[str],
-        unreadable_file_uris: set[str],
+        live_directory_sources: set[tuple[str, int]],
         counters: _ReindexCounters,
         ctx: RequestContext,
+        file_scope: bool = False,
+        lease_ref: dict[str, Any] | None = None,
     ) -> None:
         """Delete memory V records whose formal source no longer exists.
 
         Covers plain L2 files, directory L0/L1 markers, and virtual
-        ``#chunk_NNNN`` records that the current base body no longer produces.
+        legacy ``#chunk_NNNN`` records, which current memory indexing no longer produces.
         Session URIs and any record outside the memory namespace are never
         deleted here.
         """
-        chunk_pattern = _MEMORY_CHUNK_PATTERN
         orphan_ids: list[str] = []
-        for (record_uri, level), record in existing_by_uri_level.items():
+        for record_id, record in vector_inventory.items():
+            record_uri = str(record.get("uri") or "")
+            try:
+                level = int(record.get("level", -1))
+            except (TypeError, ValueError):
+                continue
+            if level not in {0, 1, 2}:
+                continue
             if is_session_uri(record_uri) or classify_uri(record_uri).context_type != "memory":
                 continue
-            record_id = str(record.get("id") or "")
+            record_id = str(record_id)
             if not record_id:
                 continue
             if level in {0, 1}:
-                if record_uri not in live_directory_uris:
+                if (
+                    record_uri not in live_directory_uris
+                    or (record_uri, level) not in live_directory_sources
+                ):
                     orphan_ids.append(record_id)
                 continue
             # level == 2
             # An actual filename wins over the virtual-chunk suffix syntax.
             if record_uri in live_file_uris:
-                continue
-            chunk_match = chunk_pattern.match(record_uri)
-            if chunk_match:
-                base_uri = chunk_match.group("base")
-                if base_uri in unreadable_file_uris:
-                    continue
-                # A chunk stays only if its base is live and the current body
-                # still produces this exact chunk URI.
-                if base_uri in live_file_uris and record_uri in live_chunk_uris:
-                    continue
-                orphan_ids.append(record_id)
                 continue
             if record_uri not in live_file_uris:
                 orphan_ids.append(record_id)
@@ -1854,9 +1860,47 @@ class ReindexExecutor:
         if service.vikingdb_manager is None:
             return
         owner_ctx = self._content_owner_ctx(root, ctx)
-        counters.deleted_records += await service.vikingdb_manager.strict_delete(
-            orphan_ids, ctx=owner_ctx
-        )
+        chunk_uris = {
+            str(vector_inventory[record_id].get("uri") or "")
+            for record_id in orphan_ids
+            if file_scope
+            and re.fullmatch(
+                re.escape(root) + r"#chunk_[0-9]{4,}",
+                str(vector_inventory[record_id].get("uri") or ""),
+            )
+        }
+        guard = None
+        try:
+            if chunk_uris:
+                fs = get_viking_fs()
+                guard = PathLockGuard(fs._async_agfs)
+                paths = [fs._uri_to_path(uri, ctx=owner_ctx) for uri in sorted(chunk_uris)]
+                kwargs = {"owner_lease_ref": lease_ref} if lease_ref is not None else {}
+                await guard.acquire(
+                    lambda: fs._async_agfs.pathlock_acquire_exact_batch(paths, **kwargs)
+                )
+                real_files = set()
+                for uri in sorted(chunk_uris):
+                    try:
+                        stat = await fs.stat(uri, ctx=owner_ctx, skip_count=True)
+                    except NotFoundError:
+                        continue
+                    if stat.get("access") == "denied":
+                        raise PermissionDeniedError(f"Cannot confirm memory chunk source: {uri}")
+                    if not stat.get("isDir", stat.get("is_dir")):
+                        real_files.add(uri)
+                orphan_ids = [
+                    record_id
+                    for record_id in orphan_ids
+                    if str(vector_inventory[record_id].get("uri") or "") not in real_files
+                ]
+            if orphan_ids:
+                counters.deleted_records += await service.vikingdb_manager.strict_delete(
+                    orphan_ids, ctx=owner_ctx
+                )
+        finally:
+            if guard is not None:
+                await guard.close()
 
     async def _read_reindex_inventory(
         self,
@@ -1866,6 +1910,7 @@ class ReindexExecutor:
         ctx: RequestContext,
         recursive: bool,
         include_direct_children: bool = False,
+        include_virtual_chunks: bool = False,
     ) -> dict[str, dict[str, Any]]:
         retry_delays = (0.0, 0.25, 1.0)
         for attempt, delay in enumerate(retry_delays, start=1):
@@ -1873,6 +1918,8 @@ class ReindexExecutor:
                 await asyncio.sleep(delay)
             try:
                 kwargs = {"include_direct_children": True} if include_direct_children else {}
+                if include_virtual_chunks:
+                    kwargs["include_virtual_chunks"] = True
                 return await vikingdb.get_reindex_inventory_under_uri(
                     uri,
                     ctx=ctx,
@@ -1931,11 +1978,22 @@ class ReindexExecutor:
         counters: _ReindexCounters,
         ctx: RequestContext,
         ingest_options: IngestOptions | None = None,
-    ) -> None:
+    ) -> dict[tuple[str, int], _SourceRead]:
+        sources: dict[tuple[str, int], _SourceRead] = {}
         for directory_uri in directory_uris:
             counters.scanned_records += 1
-            abstract = await self._read_directory_abstract(directory_uri, ctx=ctx)
-            overview = await self._read_directory_overview(directory_uri, ctx=ctx)
+            for level, filename in ((0, ".abstract.md"), (1, ".overview.md")):
+                source = await self._read_memory_directory_source(
+                    directory_uri + "/" + filename, ctx=ctx
+                )
+                sources[(directory_uri, level)] = source
+                if source.error:
+                    counters.failed_records += 1
+                    counters.warnings.append(
+                        f"Failed to read {directory_uri}/{filename}: {source.error}"
+                    )
+            abstract = sources[(directory_uri, 0)].text
+            overview = sources[(directory_uri, 1)].text
             if not abstract and not overview:
                 continue
 
@@ -1956,6 +2014,8 @@ class ReindexExecutor:
                         ingest_options=ingest_options,
                     )
                     counters.rebuilt_records += 1
+                except (asyncio.CancelledError, LockError):
+                    raise
                 except Exception as exc:
                     counters.failed_records += 1
                     counters.warnings.append(f"Failed to reindex {directory_uri} L0 vector: {exc}")
@@ -1976,9 +2036,31 @@ class ReindexExecutor:
                         ingest_options=ingest_options,
                     )
                     counters.rebuilt_records += 1
+                except (asyncio.CancelledError, LockError):
+                    raise
                 except Exception as exc:
                     counters.failed_records += 1
                     counters.warnings.append(f"Failed to reindex {directory_uri} L1 vector: {exc}")
+        return sources
+
+    async def _read_memory_directory_source(self, uri: str, *, ctx: RequestContext) -> _SourceRead:
+        try:
+            raw = await get_viking_fs().read_file(uri, ctx=ctx)
+        except (asyncio.CancelledError, LockError):
+            raise
+        except NotFoundError:
+            return _SourceRead(exists=False)
+        except Exception as exc:
+            return _SourceRead(exists=True, error=exc)
+        try:
+            text = body_for_preview(raw).strip()
+            if _is_not_ready_sentinel(text, _ABSTRACT_NOT_READY_SUFFIX) or _is_not_ready_sentinel(
+                text, _OVERVIEW_NOT_READY_SUFFIX
+            ):
+                text = ""
+            return _SourceRead(exists=True, text=text)
+        except Exception as exc:
+            return _SourceRead(exists=True, error=exc)
 
     async def _regenerate_skill_semantics(
         self, *, uri: str, ctx: RequestContext, lock: dict | None = None
@@ -2200,31 +2282,6 @@ class ReindexExecutor:
         else:
             text = str(content or "")
         return _SourceRead(exists=True, text=text)
-
-    def _chunk_memory_body(self, uri: str, body: str) -> Iterable[tuple[str, str]]:
-        semantic = get_openviking_config().semantic
-        chunk_chars = semantic.memory_chunk_chars
-        overlap = semantic.memory_chunk_overlap
-        if len(body) <= chunk_chars:
-            return []
-
-        chunks: list[str] = []
-        start = 0
-        while start < len(body):
-            previous_start = start
-            end = start + chunk_chars
-            if end < len(body):
-                boundary = body.rfind("\n\n", start, end)
-                if boundary > start + chunk_chars // 2:
-                    end = boundary + 2
-            chunks.append(body[start:end].strip())
-            start = end - overlap
-            if start <= previous_start:
-                start = previous_start + 1
-            if start >= len(body):
-                break
-
-        return [(f"{uri}#chunk_{idx:04d}", chunk) for idx, chunk in enumerate(chunks) if chunk]
 
     def _best_non_empty(self, *values: str) -> str:
         for value in values:

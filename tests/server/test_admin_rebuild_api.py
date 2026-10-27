@@ -61,7 +61,9 @@ class _NamespaceFSMixin:
         from openviking.core.namespace import uri_parts
 
         parts = uri_parts(uri)
-        root = f"viking://user/{parts[1]}" if len(parts) >= 2 and parts[0] == "user" else "viking://"
+        root = (
+            f"viking://user/{parts[1]}" if len(parts) >= 2 and parts[0] == "user" else "viking://"
+        )
         if not hasattr(self, "_scope_entries"):
             self._scope_entries = {}
         if root not in self._scope_entries:
@@ -1199,46 +1201,6 @@ async def test_reindex_upsert_uses_uri_owner_for_user_scoped_records(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_reindex_semantic_processor_uses_uri_owner_for_user_scoped_records(
-    monkeypatch, semantic_config
-):
-    from openviking.service.reindex_executor import ReindexExecutor
-
-    captured = {}
-
-    class FakeSemanticProcessor:
-        def __init__(self, **_kwargs):
-            pass
-
-        async def on_dequeue(self, payload, lock=None):
-            captured["payload"] = payload
-            captured["lock"] = lock
-            return ProcessResult.success()
-
-    monkeypatch.setattr(
-        "openviking.service.reindex_executor.SemanticProcessor",
-        FakeSemanticProcessor,
-    )
-
-    service = ReindexExecutor(vlm_resolver=semantic_config)
-    ctx = RequestContext(
-        user=UserIdentifier(account_id="acct", user_id="admin"),
-        role=Role.ROOT,
-    )
-
-    await service._run_semantic_processor(
-        uri="viking://user/bob/memories/preferences",
-        context_type="memory",
-        ctx=ctx,
-    )
-
-    data = captured["payload"]["data"]
-    assert '"user_id": "bob"' in data
-    assert '"peer_id": "bob"' in data
-    assert '"account_id": "acct"' in data
-
-
-@pytest.mark.asyncio
 async def test_reindex_memory_supports_semantic_and_vectors(monkeypatch):
     from openviking.service.reindex_executor import ReindexExecutor
 
@@ -1247,48 +1209,17 @@ async def test_reindex_memory_supports_semantic_and_vectors(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_reindex_semantic_processor_uses_configured_vlm_concurrency(
-    monkeypatch, semantic_config
-):
-    import openviking.service.reindex_executor as reindex_mod
-
-    seen = {}
-
-    class FakeSemanticProcessor:
-        def __init__(self, max_concurrent_llm=64, **kwargs):
-            del kwargs
-            seen["max_concurrent_llm"] = max_concurrent_llm
-
-        async def on_dequeue(self, data, lock=None):
-            seen["data"] = data
-            return ProcessResult.success()
-
-    monkeypatch.setattr(reindex_mod, "SemanticProcessor", FakeSemanticProcessor)
-
-    ctx = RequestContext(
-        user=UserIdentifier(account_id="test", user_id="alice"),
-        role=Role.ROOT,
-    )
-    await reindex_mod.ReindexExecutor(vlm_resolver=semantic_config)._run_semantic_processor(
-        uri="viking://resources/demo",
-        context_type="resource",
-        ctx=ctx,
-    )
-
-    assert seen["max_concurrent_llm"] == 2
-
-
-@pytest.mark.asyncio
-async def test_reindex_memory_semantic_and_vectors_rebuilds_full_subtree(monkeypatch):
+async def test_reindex_memory_semantic_and_vectors_queues_shared_tree(monkeypatch):
     from openviking.service.reindex_executor import ReindexExecutor, _ReindexCounters
 
     seen = {"semantic": [], "vectors": []}
 
-    async def fake_run_semantic_processor(self, *, uri, context_type, ctx, lock=None):
-        seen["semantic"].append((uri, context_type))
+    async def fake_enqueue(self, *, msg, root_is_dir, run):
+        seen["semantic"].append((msg, root_is_dir, run))
 
     async def fake_reindex_memory_vectors(self, *, uri, counters, ctx, **kwargs):
         seen["vectors"].append(uri)
+        seen["reconcile_only"] = kwargs.get("reconcile_only")
 
     class FakeVikingFS:
         async def stat(self, uri, ctx=None, skip_count=True):
@@ -1297,7 +1228,7 @@ async def test_reindex_memory_semantic_and_vectors_rebuilds_full_subtree(monkeyp
         async def ls(self, uri, **kwargs):
             return []
 
-    monkeypatch.setattr(ReindexExecutor, "_run_semantic_processor", fake_run_semantic_processor)
+    monkeypatch.setattr(ReindexExecutor, "_enqueue_reindex_semantic_message", fake_enqueue)
     monkeypatch.setattr(ReindexExecutor, "_reindex_memory_vectors", fake_reindex_memory_vectors)
     monkeypatch.setattr("openviking.service.reindex_executor.get_viking_fs", lambda: FakeVikingFS())
 
@@ -1319,8 +1250,11 @@ async def test_reindex_memory_semantic_and_vectors_rebuilds_full_subtree(monkeyp
         run=_make_reindex_run(ctx, counters),
     )
 
-    assert seen["semantic"] == [("viking://user/default/memories", "memory")]
+    assert len(seen["semantic"]) == 1
+    assert seen["semantic"][0][0].context_type == "memory"
+    assert seen["semantic"][0][0].skip_vectorization is False
     assert seen["vectors"] == ["viking://user/default/memories"]
+    assert seen["reconcile_only"] is True
 
 
 @pytest.mark.asyncio
@@ -1389,7 +1323,7 @@ async def test_reindex_memory_non_recursive_limits_semantics_and_vectors(monkeyp
 
     seen = {}
 
-    async def fake_run_semantic_processor(self, **kwargs):
+    async def fake_enqueue(self, **kwargs):
         seen["semantic"] = kwargs
 
     async def fake_reindex_memory_vectors(self, **kwargs):
@@ -1399,7 +1333,7 @@ async def test_reindex_memory_non_recursive_limits_semantics_and_vectors(monkeyp
         async def stat(self, uri, ctx=None, skip_count=True):
             return {"isDir": True}
 
-    monkeypatch.setattr(ReindexExecutor, "_run_semantic_processor", fake_run_semantic_processor)
+    monkeypatch.setattr(ReindexExecutor, "_enqueue_reindex_semantic_message", fake_enqueue)
     monkeypatch.setattr(ReindexExecutor, "_reindex_memory_vectors", fake_reindex_memory_vectors)
     monkeypatch.setattr("openviking.service.reindex_executor.get_viking_fs", lambda: FakeVikingFS())
 
@@ -1419,8 +1353,10 @@ async def test_reindex_memory_non_recursive_limits_semantics_and_vectors(monkeyp
         run=_make_reindex_run(ctx, _ReindexCounters()),
     )
 
-    assert seen["semantic"]["recursive"] is False
+    assert seen["semantic"]["msg"].recursive is False
+    assert seen["semantic"]["msg"].skip_vectorization is False
     assert seen["vectors"]["recursive"] is False
+    assert seen["vectors"]["reconcile_only"] is True
 
 
 @pytest.mark.asyncio
@@ -1819,7 +1755,13 @@ async def test_reindex_skill_namespace_reindexes_only_skill_roots(monkeypatch):
     assert args.kwargs["ctx"].user.user_id == "default"
     assert args.kwargs["recursive"] is True
     assert set(args.kwargs["output_fields"]) == {
-        "abstract", "context_type", "owner_user_id", "name", "description", "tags", "search_tags"
+        "abstract",
+        "context_type",
+        "owner_user_id",
+        "name",
+        "description",
+        "tags",
+        "search_tags",
     }
 
 
@@ -1968,128 +1910,6 @@ async def test_reindex_upsert_context_omits_search_tags_without_ingest_options(m
     assert "search_tags" not in captured["meta"]
     assert "search_tags" not in captured["msg"].context_data
     assert captured["msg"].context_data["md5"] == "final-md5"
-
-
-@pytest.mark.asyncio
-@pytest.mark.asyncio
-async def test_reindex_semantic_processor_runs_with_skip_vectorization(
-    monkeypatch, semantic_config
-):
-    from openviking.service.reindex_executor import ReindexExecutor
-
-    seen = {}
-
-    class FakeSemanticProcessor:
-        def __init__(self, **_kwargs):
-            pass
-
-        async def on_dequeue(self, payload, lock=None):
-            seen["payload"] = payload
-            return ProcessResult.success()
-
-    monkeypatch.setattr(
-        "openviking.service.reindex_executor.SemanticProcessor",
-        FakeSemanticProcessor,
-    )
-
-    service = ReindexExecutor(vlm_resolver=semantic_config)
-    ctx = RequestContext(
-        user=UserIdentifier(account_id="test", user_id="alice"),
-        role=Role.ROOT,
-    )
-
-    await service._run_semantic_processor(
-        uri="viking://resources/demo",
-        context_type="resource",
-        ctx=ctx,
-    )
-
-    import json
-
-    msg = json.loads(seen["payload"]["data"])
-    assert msg["skip_vectorization"] is True
-    assert msg["recursive"] is True
-    assert msg["use_hierarchical_aggregation"] is False
-    assert msg["propagate_to_parent"] is True
-
-
-@pytest.mark.asyncio
-async def test_reindex_semantic_processor_passes_non_recursive_message(
-    monkeypatch, semantic_config
-):
-    from openviking.service.reindex_executor import ReindexExecutor
-
-    seen = {}
-
-    class FakeSemanticProcessor:
-        def __init__(self, **_kwargs):
-            pass
-
-        async def on_dequeue(self, payload, lock=None):
-            seen["payload"] = payload
-            return ProcessResult.success()
-
-    monkeypatch.setattr(
-        "openviking.service.reindex_executor.SemanticProcessor",
-        FakeSemanticProcessor,
-    )
-    ctx = RequestContext(
-        user=UserIdentifier(account_id="test", user_id="alice"),
-        role=Role.ROOT,
-    )
-    await ReindexExecutor(vlm_resolver=semantic_config)._run_semantic_processor(
-        uri="viking://resources/demo",
-        context_type="resource",
-        ctx=ctx,
-        recursive=False,
-    )
-
-    import json
-
-    msg = json.loads(seen["payload"]["data"])
-    assert msg["recursive"] is False
-    assert msg["use_hierarchical_aggregation"] is False
-    assert msg["propagate_to_parent"] is False
-
-
-@pytest.mark.asyncio
-async def test_reindex_semantic_processor_sets_memory_aggregation_policy(
-    monkeypatch, semantic_config
-):
-    from openviking.service.reindex_executor import ReindexExecutor
-
-    seen = {}
-
-    class FakeSemanticProcessor:
-        def __init__(self, **_kwargs):
-            pass
-
-        async def on_dequeue(self, payload, lock=None):
-            seen["payload"] = payload
-            return ProcessResult.success()
-
-    monkeypatch.setattr(
-        "openviking.service.reindex_executor.SemanticProcessor",
-        FakeSemanticProcessor,
-    )
-    ctx = RequestContext(
-        user=UserIdentifier(account_id="test", user_id="alice"),
-        role=Role.ROOT,
-    )
-
-    await ReindexExecutor(vlm_resolver=semantic_config)._run_semantic_processor(
-        uri="viking://user/alice/memories/preferences",
-        context_type="memory",
-        ctx=ctx,
-        recursive=False,
-    )
-
-    import json
-
-    msg = json.loads(seen["payload"]["data"])
-    assert msg["generation_trigger"] == "reindex"
-    assert msg["use_hierarchical_aggregation"] is True
-    assert msg["propagate_to_parent"] is False
 
 
 @pytest.mark.asyncio
@@ -2517,9 +2337,6 @@ async def test_reindex_memory_keeps_live_chunks_and_excludes_sessions(monkeypatc
     async def fake_upsert_context(self, **kwargs):
         return None
 
-    def fake_chunk_memory_body(self, uri, body):
-        return [(f"{uri}#chunk_0000", "c0"), (f"{uri}#chunk_0001", "c1")]
-
     monkeypatch.setattr("openviking.service.reindex_executor.get_viking_fs", lambda: FakeVikingFS())
     monkeypatch.setattr(
         "openviking.service.reindex_executor.get_service",
@@ -2529,7 +2346,6 @@ async def test_reindex_memory_keeps_live_chunks_and_excludes_sessions(monkeypatc
     monkeypatch.setattr(ReindexExecutor, "_read_memory_body", fake_read_memory_body)
     monkeypatch.setattr(ReindexExecutor, "_safe_read_text", fake_safe_read_text)
     monkeypatch.setattr(ReindexExecutor, "_upsert_context", fake_upsert_context)
-    monkeypatch.setattr(ReindexExecutor, "_chunk_memory_body", fake_chunk_memory_body)
 
     service = ReindexExecutor()
     counters = _ReindexCounters()
@@ -2544,10 +2360,10 @@ async def test_reindex_memory_keeps_live_chunks_and_excludes_sessions(monkeypatc
         ctx=ctx,
     )
 
-    # Only the stale chunk is an orphan; live base + its two current chunks stay,
-    # and the session-scoped leak is never deleted by a memory reindex.
-    assert deleted["ids"] == ["stale-chunk"]
-    assert counters.deleted_records == 1
+    # Current indexing uses the base L2; every virtual chunk is legacy data.
+    # The session-scoped leak remains outside memory cleanup.
+    assert set(deleted["ids"]) == {"chunk0", "chunk1", "stale-chunk"}
+    assert counters.deleted_records == 3
 
 
 @pytest.mark.asyncio
@@ -2992,8 +2808,17 @@ async def test_reindex_memory_vectors_rebuilds_directory_levels_without_regenera
         )
 
     monkeypatch.setattr("openviking.service.reindex_executor.get_viking_fs", lambda: FakeVikingFS())
-    monkeypatch.setattr(ReindexExecutor, "_read_directory_abstract", fake_read_directory_abstract)
-    monkeypatch.setattr(ReindexExecutor, "_read_directory_overview", fake_read_directory_overview)
+
+    async def fake_directory_source(self, uri, *, ctx):
+        directory, filename = uri.rsplit("/", 1)
+        reader = (
+            fake_read_directory_abstract
+            if filename == ".abstract.md"
+            else fake_read_directory_overview
+        )
+        return _SourceRead(exists=True, text=await reader(self, directory, ctx=ctx))
+
+    monkeypatch.setattr(ReindexExecutor, "_read_memory_directory_source", fake_directory_source)
     monkeypatch.setattr(ReindexExecutor, "_read_memory_body", fake_read_memory_body)
     monkeypatch.setattr(ReindexExecutor, "_fetch_existing_record", fake_fetch_existing_record)
     monkeypatch.setattr(ReindexExecutor, "_best_file_summary", fake_best_file_summary)

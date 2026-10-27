@@ -689,6 +689,12 @@ Each of the four user prefixes supplies one complete lightweight vector inventor
 
 Namespace reindex discovers dynamic roots from both formal entries and vector records, so it can clean a missing memory root/shard, skill package or peer content root while holding the parent scope's lock. Directly requesting a target that is already absent still returns `NOT_FOUND`; use an existing parent content scope or namespace to reconcile its orphan vectors.
 
+Memory reindex removes every physical ID of an orphan. Memory indexing uses the original file's L2 and no longer generates virtual `#chunk_NNNN` records. Reindex removes those unused legacy records, including for an explicit file target, even if base-file processing fails. Base-file failures are reported separately and its existing L2 is preserved. Real files whose names resemble chunk URIs remain protected.
+
+Memory directory L0/L1 records require a nonempty, valid `.abstract.md`/`.overview.md` source for the respective level. A confirmed missing or empty source removes old records at that level; IO or format errors preserve them, increase `failed_records`, and add a warning. The other level and healthy files continue processing.
+
+For `semantic_and_vectors`, memory performs orphan reconciliation first, then hands its lock to the same Semantic queue used by `add_resources`. That queue owns semantic generation, file and directory vectorization, retries/requeues, embedding work, and TaskTracker accounting; reindex waits for the shared child work before completion. An explicit file reindex locks candidate legacy chunk paths and checks them again before deletion, so a concurrently created real file's vector is preserved. These extra exact locks cover only candidate chunk paths and are released on completion, failure, or cancellation.
+
 **Modes**
 
 - `vectors_only`: compares current source MD5 values with vector-record MD5 values through RFV and rebuilds only missing or stale L0/L1/L2 records; it does not rewrite `.abstract.md` or `.overview.md`

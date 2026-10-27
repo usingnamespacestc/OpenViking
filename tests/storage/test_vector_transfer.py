@@ -768,6 +768,50 @@ async def test_reindex_inventory_reads_one_complete_prefix_without_scroll_pages(
 
 
 @pytest.mark.asyncio
+async def test_reindex_file_inventory_includes_only_exact_base_and_numeric_chunks():
+    uri = "viking://user/alice/memories/events/a.md"
+    backend = _RealAclMemoryTransferBackend(
+        [
+            _record("base", uri),
+            _record("chunk-a", uri + "#chunk_0000"),
+            _record("chunk-b", uri + "#chunk_0042"),
+            _record("long-index", uri + "#chunk_10000"),
+            _record("neighbor", uri + "-other#chunk_0000"),
+            _record("literal", uri + "#chunk_notes"),
+            _record("nested", uri + "#chunk_0000/nested.md"),
+            _record("directory", uri + "#chunk_0000", level=0),
+            _record("other-owner", uri.replace("alice", "bob") + "#chunk_0000"),
+        ]
+    )
+    result = await backend.get_reindex_inventory_under_uri(
+        uri,
+        ctx=_ctx(),
+        recursive=False,
+        include_virtual_chunks=True,
+    )
+    assert set(result) == {"base", "chunk-a", "chunk-b", "long-index"}
+    assert len(backend.filter_calls) == 1
+    assert backend.scroll_filters == []
+
+
+@pytest.mark.asyncio
+async def test_reindex_file_chunk_inventory_uses_supported_path_filter():
+    uri = "viking://user/alice/memories/events/a.md"
+    backend = _RealAclMemoryTransferBackend(
+        [_record("base", uri), _record("chunk", uri + "#chunk_0000")]
+    )
+    await backend.get_reindex_inventory_under_uri(
+        uri,
+        ctx=_ctx(),
+        recursive=False,
+        include_virtual_chunks=True,
+    )
+    scope, _, _ = backend.filter_calls[0]
+    assert PathScope("uri", uri.rsplit("/", 1)[0], depth=1) in scope.conds
+    assert all(not isinstance(cond, (RawDSL, Or, Contains)) for cond in scope.conds)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("recursive", "include_direct_children", "expected_ids", "expected_depth"),
     [

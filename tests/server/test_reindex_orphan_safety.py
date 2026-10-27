@@ -72,15 +72,22 @@ async def test_peer_cleanup_preserves_live_roots_and_only_deletes_missing_memory
     executor._reindex_rfv = AsyncMock()
     executor._upsert_context = AsyncMock()
     executor._effective_file_vectorization_concurrency = lambda: 2
-    executor._chunk_memory_body = lambda uri, body: [(uri + "#chunk_0000", body)]
     run = _ReindexRunContext(ctx=owner_context(), counters=_ReindexCounters())
     await executor._reindex_peer_scopes(uri=root, mode="vectors_only", run=run, inventory=inventory)
-    assert set(db.strict_delete.await_args.args[0]) == {"gone-l0", "gone-l2", "gone-chunk"}
-    assert run.counters.deleted_records == 3
+    deleted_ids = {
+        record_id for call in db.strict_delete.await_args_list for record_id in call.args[0]
+    }
+    assert deleted_ids == {
+        "gone-l0",
+        "gone-l2",
+        "gone-chunk",
+        "live-chunk",
+    }
+    assert run.counters.deleted_records == 4
     by_uri = {call.kwargs["uri"]: call.kwargs for call in executor._reindex_rfv.await_args_list}
     assert by_uri[resource]["root_exists"] is True
     assert by_uri[gone_resource]["root_exists"] is False
-    assert {"live-l0", "live-l2", "live-chunk"}.isdisjoint(db.strict_delete.await_args.args[0])
+    assert {"live-l0", "live-l2"}.isdisjoint(deleted_ids)
 
 
 @pytest.mark.asyncio
@@ -243,7 +250,7 @@ async def test_memory_read_error_protects_chunks_and_other_files_still_converge(
     monkeypatch.setattr(reindex_module, "get_viking_fs", lambda: fs)
     monkeypatch.setattr(reindex_module, "get_service", lambda: SimpleNamespace(vikingdb_manager=db))
     executor = ReindexExecutor()
-    executor._reindex_memory_directory_chain = AsyncMock()
+    executor._reindex_memory_directory_chain = AsyncMock(return_value={})
     executor._safe_read_text = AsyncMock(return_value="")
     executor._upsert_context = AsyncMock()
     executor._effective_file_vectorization_concurrency = lambda: 2
@@ -256,7 +263,6 @@ async def test_memory_read_error_protects_chunks_and_other_files_still_converge(
         )
 
     executor._read_memory_body = AsyncMock(side_effect=body)
-    executor._chunk_memory_body = lambda uri, text: [(uri + "#chunk_0000", text)]
     uris = {
         "failed": failed_file,
         "failed-c0": failed_file + "#chunk_0000",
@@ -272,7 +278,14 @@ async def test_memory_read_error_protects_chunks_and_other_files_still_converge(
     await executor._reindex_memory_vectors(
         uri=root, ctx=owner_context(), counters=counters, vector_inventory=inventory
     )
-    assert set(db.strict_delete.await_args.args[0]) == {"stale", "gone", "gone-c0"}
+    assert set(db.strict_delete.await_args.args[0]) == {
+        "failed-c0",
+        "failed-c1",
+        "healthy-c0",
+        "stale",
+        "gone",
+        "gone-c0",
+    }
     assert counters.failed_records == 1
     assert counters.rebuilt_records == 1
     executor._upsert_context.assert_awaited_once()
@@ -293,11 +306,10 @@ async def test_literal_chunk_filename_is_never_deleted(monkeypatch, is_directory
     monkeypatch.setattr(reindex_module, "get_viking_fs", lambda: fs)
     monkeypatch.setattr(reindex_module, "get_service", lambda: SimpleNamespace(vikingdb_manager=db))
     executor = ReindexExecutor()
-    executor._reindex_memory_directory_chain = AsyncMock()
+    executor._reindex_memory_directory_chain = AsyncMock(return_value={})
     executor._read_memory_body = AsyncMock(return_value=_SourceRead(exists=True, text="real file"))
     executor._safe_read_text = AsyncMock(return_value="")
     executor._upsert_context = AsyncMock()
-    executor._chunk_memory_body = lambda uri, body: []
     executor._effective_file_vectorization_concurrency = lambda: 1
     counters = _ReindexCounters()
     await executor._reindex_memory_vectors(
@@ -327,13 +339,12 @@ async def test_denied_memory_tree_fails_before_inventory_or_mutation(monkeypatch
     monkeypatch.setattr(reindex_module, "get_viking_fs", lambda: fs)
     monkeypatch.setattr(reindex_module, "get_service", lambda: SimpleNamespace(vikingdb_manager=db))
     executor = ReindexExecutor()
-    executor._reindex_memory_directory_chain = AsyncMock()
+    executor._reindex_memory_directory_chain = AsyncMock(return_value={})
     executor._upsert_context = AsyncMock()
     executor._read_memory_body = AsyncMock(
         return_value=_SourceRead(exists=True, text="hidden body")
     )
     executor._safe_read_text = AsyncMock(return_value="")
-    executor._chunk_memory_body = lambda uri, body: []
     executor._effective_file_vectorization_concurrency = lambda: 1
     with pytest.raises(ValueError, match="incomplete"):
         await executor._reindex_memory_vectors(
