@@ -9,6 +9,9 @@ description: |
   Use the same language as the user's conversation. Extract only facts explicitly stated
   or confirmed by that participant. Never infer attributes from assistant text, jokes,
   hypotheticals, or role-play.
+  When explicit statements conflict, keep the latest current self-report and remove the
+  superseded value. If recency is unclear, preserve the uncertainty instead of choosing
+  silently.
 
   # Profile inclusion rule: current durable states only
   A fact belongs in PROFILE only when it describes a current state that is expected to

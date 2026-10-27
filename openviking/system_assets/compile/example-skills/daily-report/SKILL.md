@@ -1,6 +1,6 @@
 ---
 name: daily-report
-description: Compile timestamped conversation logs, agent sessions, IM messages, collaborative documents, meeting notes, task records, and similar OpenViking materials into concise, evidence-grounded daily reports. Use with ov compile when the user asks for a daily work report, end-of-day digest, 日报, or reports for one or more dates, especially when activities must be reconstructed across heterogeneous sources without treating plans or agent suggestions as completed work.
+description: Compile timestamped conversation logs, agent sessions, IM messages, collaborative documents, meeting notes, task records, and similar OpenViking materials into concise, evidence-grounded daily reports. Use with ov compile when the user asks for a daily work report, end-of-day digest, 日报, or reports for one or more dates, especially when activities must be reconstructed across heterogeneous sources without treating plans or agent suggestions as completed work. When evidence conflicts, prefer the latest timestamped source and state unresolved contradictions explicitly.
 ---
 
 # Daily Report
