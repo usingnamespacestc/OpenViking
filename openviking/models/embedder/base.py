@@ -5,13 +5,12 @@ import contextvars
 import logging
 import random
 import time
-import weakref
 from abc import ABC, abstractmethod
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from threading import Lock
 from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Optional, TypeVar, Union
 
+from openviking.concurrency import AsyncSemaphore
 from openviking.models.model_error import model_error_kind
 from openviking.telemetry import get_current_telemetry
 from openviking.utils.embedding_input import (
@@ -121,20 +120,6 @@ EmbeddingInput = Union[str, List[Dict[str, Any]]]
 
 
 _token_tracker_instance = None
-_ASYNC_EMBED_SEMAPHORES: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, Dict[int, asyncio.Semaphore]]" = weakref.WeakKeyDictionary()
-_ASYNC_EMBED_LOCK = Lock()
-
-
-def _get_async_embed_semaphore(limit: int) -> asyncio.Semaphore:
-    loop = asyncio.get_running_loop()
-    normalized_limit = max(1, limit)
-    with _ASYNC_EMBED_LOCK:
-        semaphores_by_limit = _ASYNC_EMBED_SEMAPHORES.setdefault(loop, {})
-        semaphore = semaphores_by_limit.get(normalized_limit)
-        if semaphore is None:
-            semaphore = asyncio.Semaphore(normalized_limit)
-            semaphores_by_limit[normalized_limit] = semaphore
-        return semaphore
 
 
 def _get_token_tracker():
@@ -296,6 +281,12 @@ class EmbedderBase(ABC):
         self.max_input_tokens = resolve_embedding_max_input_tokens(self.config)
         self.max_retries = int(self.config.get("max_retries", 3))
         self.max_concurrent = int(self.config.get("max_concurrent", 10))
+        # EmbeddingConfig rejects reservations that leave no indexing capacity;
+        # clamp here so directly constructed embedders and wrappers still build.
+        limit = max(1, self.max_concurrent)
+        reserved = int(self.config.get("query_reserved_concurrency", 0))
+        # Loop-independent so HTTP and queue-worker loops share this embedder's limit.
+        self._embed_semaphore = AsyncSemaphore(limit, reserved=max(0, min(reserved, limit - 1)))
         self.provider = self.config.get("provider", "unknown")
 
         # Token usage tracking
@@ -394,13 +385,12 @@ class EmbedderBase(ABC):
         *,
         logger=None,
         operation_name: str,
+        is_query: bool = False,
     ) -> T:
         """Run one async provider request with concurrency and telemetry guards."""
-        semaphore = getattr(self, "_account_semaphore", None)
-        if semaphore is None:
-            semaphore = _get_async_embed_semaphore(self.max_concurrent)
+        semaphore = getattr(self, "_account_semaphore", None) or self._embed_semaphore
         wait_started = time.monotonic()
-        await semaphore.acquire()
+        await semaphore.acquire(priority=is_query)
         wait_elapsed = time.monotonic() - wait_started
         telemetry = get_current_telemetry()
         telemetry.set("embedding.async.max_concurrent", self.max_concurrent)
@@ -424,7 +414,7 @@ class EmbedderBase(ABC):
                     elapsed * 1000,
                 )
             self._active_call_started_at = previous_started_at
-            semaphore.release()
+            semaphore.release(priority=is_query)
 
     @property
     def is_dense(self) -> bool:

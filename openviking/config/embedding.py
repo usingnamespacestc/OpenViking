@@ -179,7 +179,7 @@ class AccountEmbeddingProvider:
                 tracker = self._usage.setdefault(account_id, TokenUsageTracker())
             _bind_account_state(
                 embedder,
-                AsyncSemaphore(config.max_concurrent),
+                AsyncSemaphore(config.max_concurrent, reserved=config.query_reserved_concurrency),
                 tracker,
                 account_id,
             )

@@ -656,6 +656,14 @@ class EmbeddingConfig(BaseModel):
         ge=1,
         description="Maximum number of concurrent embedding requests",
     )
+    query_reserved_concurrency: int = Field(
+        default=0,
+        ge=0,
+        description=(
+            "Embedding request slots, out of max_concurrent, that only retrieval queries "
+            "may use; queued queries are also served before queued indexing requests"
+        ),
+    )
     max_retries: int = Field(
         default=3,
         description="Maximum retry attempts for embedding provider calls (0 disables retry)",
@@ -714,6 +722,10 @@ class EmbeddingConfig(BaseModel):
             self.text_source = TEXT_SOURCE_SUMMARY_FIRST
         if self.text_source not in TEXT_SOURCES:
             raise ValueError("embedding.text_source must be one of: summary_first, content_only")
+        if self.query_reserved_concurrency >= self.max_concurrent:
+            raise ValueError(
+                "embedding.query_reserved_concurrency must be less than embedding.max_concurrent"
+            )
         return self
 
     def _create_embedder(
@@ -761,6 +773,7 @@ class EmbeddingConfig(BaseModel):
         runtime_config = {
             "max_retries": self.max_retries,
             "max_concurrent": self.max_concurrent,
+            "query_reserved_concurrency": self.query_reserved_concurrency,
             "max_input_tokens": self.max_input_tokens,
         }
 

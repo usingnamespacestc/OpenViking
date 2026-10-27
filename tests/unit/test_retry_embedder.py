@@ -330,3 +330,122 @@ def test_factory_places_retry_inside_composite(monkeypatch):
     assert isinstance(embedder, CompositeHybridEmbedder)
     assert isinstance(embedder.dense_embedder, RetryEmbedder)
     assert isinstance(embedder.sparse_embedder, RetryEmbedder)
+
+
+class GatedEmbedder(DenseEmbedderBase):
+    """Holds each call open until its content's gate is set."""
+
+    def __init__(self, max_concurrent: int, reserved: int = 0):
+        super().__init__(
+            "gated",
+            {"max_concurrent": max_concurrent, "query_reserved_concurrency": reserved},
+        )
+        self.gates: dict[str, asyncio.Event] = {}
+        self.started: list[str] = []
+
+    def embed(self, content, is_query=False):
+        raise NotImplementedError
+
+    def get_dimension(self):
+        return 1
+
+    async def embed_async(self, content, is_query=False):
+        async def call():
+            self.started.append(content)
+            await self.gates.setdefault(content, asyncio.Event()).wait()
+            return EmbedResult(dense_vector=[0.0])
+
+        return await self._run_once_async(call, operation_name="gated", is_query=is_query)
+
+    def start(self, *contents: str) -> list[asyncio.Task]:
+        return [
+            asyncio.create_task(self.embed_async(c, is_query=c.startswith("q"))) for c in contents
+        ]
+
+    async def finish(self, content: str) -> None:
+        self.gates.setdefault(content, asyncio.Event()).set()
+        await settle()
+
+
+async def settle():
+    for _ in range(10):
+        await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_query_reservation_caps_documents_and_serves_queries_first():
+    embedder = GatedEmbedder(max_concurrent=3, reserved=1)
+    tasks = embedder.start("d1", "d2", "d3")
+    await settle()
+    assert embedder.started == ["d1", "d2"]
+
+    tasks += embedder.start("q1", "q2")
+    await settle()
+    assert embedder.started == ["d1", "d2", "q1"]
+
+    await embedder.finish("d1")
+    assert embedder.started == ["d1", "d2", "q1", "q2"]
+    await embedder.finish("q1")
+    assert embedder.started[-1] == "d3"
+
+    for content in ("d2", "d3", "q2"):
+        await embedder.finish(content)
+    await asyncio.gather(*tasks)
+
+
+@pytest.mark.asyncio
+async def test_without_reservation_calls_share_one_fifo_limit():
+    embedder = GatedEmbedder(max_concurrent=2)
+    tasks = embedder.start("d1", "q1", "d2", "q2")
+    await settle()
+    assert embedder.started == ["d1", "q1"]
+
+    await embedder.finish("d1")
+    assert embedder.started == ["d1", "q1", "d2"]
+
+    for content in ("q1", "d2", "q2"):
+        await embedder.finish(content)
+    await asyncio.gather(*tasks)
+
+
+@pytest.mark.asyncio
+async def test_embedders_with_same_limit_do_not_share_a_gate():
+    first, second = GatedEmbedder(max_concurrent=1), GatedEmbedder(max_concurrent=1)
+    tasks = first.start("d1") + second.start("d2")
+    await settle()
+    assert first.started == ["d1"] and second.started == ["d2"]
+
+    await first.finish("d1")
+    await second.finish("d2")
+    await asyncio.gather(*tasks)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_waiters_do_not_strand_permits():
+    embedder = GatedEmbedder(max_concurrent=2, reserved=1)
+    tasks = embedder.start("d1", "q1", "q2", "d2")
+    await settle()
+    tasks[2].cancel()
+    await embedder.finish("d1")
+    assert embedder.started == ["d1", "q1", "d2"]
+
+    # Cancellation racing a grant must hand the permit back.
+    semaphore = AsyncSemaphore(2, reserved=1)
+    await semaphore.acquire(priority=True)
+    await semaphore.acquire()
+    waiter = asyncio.create_task(semaphore.acquire(priority=True))
+    await settle()
+    semaphore.release()
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+    await asyncio.wait_for(semaphore.acquire(), timeout=1)
+
+    for content in ("q1", "d2"):
+        await embedder.finish(content)
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+
+def test_query_reservation_must_leave_document_capacity():
+    with pytest.raises(ValueError, match="query_reserved_concurrency"):
+        EmbeddingConfig(max_concurrent=2, query_reserved_concurrency=2)

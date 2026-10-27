@@ -96,6 +96,7 @@ class AccountEmbeddingConfig(BaseModel):
     sparse: Optional[AccountEmbeddingModelConfig] = RuntimeField(default=None)
     hybrid: Optional[AccountEmbeddingModelConfig] = RuntimeField(default=None)
     max_concurrent: Optional[int] = RuntimeField(default=None, ge=1)
+    query_reserved_concurrency: Optional[int] = RuntimeField(default=None, ge=0)
     max_retries: Optional[int] = RuntimeField(default=None, ge=0)
     circuit_breaker: Optional[AccountEmbeddingCircuitBreakerConfig] = RuntimeField(
         default=None

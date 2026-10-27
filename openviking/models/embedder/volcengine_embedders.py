@@ -358,6 +358,7 @@ class VolcengineDenseEmbedder(DenseEmbedderBase):
                 _embed_call,
                 logger=logger,
                 operation_name="Volcengine async embedding",
+                is_query=is_query,
             )
         except Exception as e:
             raise RuntimeError(f"Volcengine embedding failed: {str(e)}") from e
@@ -515,6 +516,7 @@ class VolcengineSparseEmbedder(SparseEmbedderBase):
                 _embed_call,
                 logger=logger,
                 operation_name="Volcengine async sparse embedding",
+                is_query=is_query,
             )
         except Exception as e:
             raise RuntimeError(f"Volcengine sparse embedding failed: {str(e)}") from e
@@ -709,6 +711,7 @@ class VolcengineHybridEmbedder(HybridEmbedderBase):
                 _embed_call,
                 logger=logger,
                 operation_name="Volcengine async hybrid embedding",
+                is_query=is_query,
             )
         except Exception as e:
             raise RuntimeError(f"Volcengine hybrid embedding failed: {str(e)}") from e

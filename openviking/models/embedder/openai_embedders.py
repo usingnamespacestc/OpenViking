@@ -423,6 +423,7 @@ class OpenAIDenseEmbedder(DenseEmbedderBase):
                 _call,
                 logger=logger,
                 operation_name="OpenAI async embedding",
+                is_query=is_query,
             )
         except openai.APIError as e:
             raise RuntimeError(f"OpenAI API error: {e.message}") from e

@@ -217,6 +217,7 @@ class LiteLLMDenseEmbedder(DenseEmbedderBase):
                 _call,
                 logger=logger,
                 operation_name="LiteLLM async embedding",
+                is_query=is_query,
             )
         except Exception as e:
             raise RuntimeError(f"LiteLLM embedding failed: {e}") from e

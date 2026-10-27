@@ -65,28 +65,40 @@ class AsyncSemaphore:
 
     The thread lock only protects admission and handoff. Contended callers
     await a future on their own loop; no executor thread is occupied waiting.
+
+    ``reserved`` permits are usable only by ``priority`` callers, which are also
+    woken before ordinary waiters. Without a reservation every caller shares one
+    FIFO queue, so ``priority`` has no effect.
     """
 
-    def __init__(self, value: int = 1) -> None:
+    def __init__(self, value: int = 1, *, reserved: int = 0) -> None:
         if value < 0:
             raise ValueError("Semaphore initial value must be >= 0")
+        if reserved < 0 or (reserved and reserved >= value):
+            raise ValueError("Semaphore reserved value must be >= 0 and < initial value")
         self._value = value
+        self._reserved = reserved
+        self._ordinary_limit = value - reserved
+        self._ordinary_held = 0
         self._lock = threading.Lock()
         self._waiters: deque[Future[None]] = deque()
+        self._priority_waiters: deque[Future[None]] = deque()
 
-    async def acquire(self) -> None:
+    async def acquire(self, *, priority: bool = False) -> None:
+        priority = priority and bool(self._reserved)
+        waiters = self._priority_waiters if priority else self._waiters
         with self._lock:
-            if self._value:
-                self._value -= 1
+            if not waiters and self._can_take(priority):
+                self._take(priority)
                 return
             waiter: Future[None] = Future()
-            self._waiters.append(waiter)
+            waiters.append(waiter)
         try:
             await asyncio.wrap_future(waiter)
         except BaseException:
             with self._lock:
                 try:
-                    self._waiters.remove(waiter)
+                    waiters.remove(waiter)
                 except ValueError:
                     # A granted slot must be returned even if cancellation
                     # reached this loop before the grant callback did.
@@ -94,17 +106,33 @@ class AsyncSemaphore:
                 else:
                     granted = False
             if granted:
-                self.release()
+                self.release(priority=priority)
             raise
 
-    def release(self) -> None:
+    def release(self, *, priority: bool = False) -> None:
         with self._lock:
-            while self._waiters:
-                waiter = self._waiters.popleft()
-                if waiter.set_running_or_notify_cancel():
-                    waiter.set_result(None)
-                    return
             self._value += 1
+            if self._reserved and not priority:
+                self._ordinary_held -= 1
+            self._wake()
+
+    def _can_take(self, priority: bool) -> bool:
+        if priority or not self._reserved:
+            return self._value > 0
+        return self._value > 0 and self._ordinary_held < self._ordinary_limit
+
+    def _take(self, priority: bool) -> None:
+        self._value -= 1
+        if self._reserved and not priority:
+            self._ordinary_held += 1
+
+    def _wake(self) -> None:
+        for priority, waiters in ((True, self._priority_waiters), (False, self._waiters)):
+            while waiters and self._can_take(priority):
+                waiter = waiters.popleft()
+                if waiter.set_running_or_notify_cancel():
+                    self._take(priority)
+                    waiter.set_result(None)
 
     async def __aenter__(self) -> "AsyncSemaphore":
         await self.acquire()

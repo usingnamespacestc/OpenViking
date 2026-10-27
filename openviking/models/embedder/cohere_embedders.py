@@ -172,6 +172,7 @@ class CohereDenseEmbedder(DenseEmbedderBase):
                 _call,
                 logger=logger,
                 operation_name="Cohere async embedding",
+                is_query=is_query,
             )
             estimated_tokens = self._estimate_tokens(text)
             self.update_token_usage(

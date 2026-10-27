@@ -232,6 +232,7 @@ class VikingDBDenseEmbedder(DenseEmbedderBase, VikingDBClientMixin):
             _call,
             logger=logger,
             operation_name="VikingDB async embedding",
+            is_query=is_query,
         )
         estimated_tokens = self._estimate_tokens(text)
         self.update_token_usage(
@@ -316,6 +317,7 @@ class VikingDBSparseEmbedder(SparseEmbedderBase, VikingDBClientMixin):
             _call,
             logger=logger,
             operation_name="VikingDB async sparse embedding",
+            is_query=is_query,
         )
         estimated_tokens = self._estimate_tokens(text)
         self.update_token_usage(
@@ -431,6 +433,7 @@ class VikingDBHybridEmbedder(HybridEmbedderBase, VikingDBClientMixin):
             _call,
             logger=logger,
             operation_name="VikingDB async hybrid embedding",
+            is_query=is_query,
         )
         estimated_tokens = self._estimate_tokens(text)
         self.update_token_usage(
