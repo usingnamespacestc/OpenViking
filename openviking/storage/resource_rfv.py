@@ -91,6 +91,7 @@ async def build_rfv_snapshot(
     source_read_concurrency: int = 8,
     root_is_dir: bool | None = None,
     formal_inventory: tuple[bool, list[Mapping[str, Any]], bool] | None = None,
+    vector_inventory: Mapping[str, Mapping[str, Any]] | None = None,
     root_exists: bool = True,
 ) -> RFVSnapshot:
     """Read one complete F/V inventory and each selected embedding source once.
@@ -141,16 +142,19 @@ async def build_rfv_snapshot(
         complete = not any(entry.get("access") == "denied" for entry in raw_entries)
         return is_dir, list(raw_entries), complete
 
-    formal_task = asyncio.create_task(read_formal_inventory())
-    vector_task = asyncio.create_task(
-        vikingdb.get_incremental_inventory_under_uri(
+    async def read_vector_inventory() -> Mapping[str, Mapping[str, Any]]:
+        if vector_inventory is not None:
+            return vector_inventory
+        return await vikingdb.get_incremental_inventory_under_uri(
             root,
             ctx=ctx,
             output_fields=sorted(projection),
             recursive=recursive,
             include_direct_children=include_direct_children,
         )
-    )
+
+    formal_task = asyncio.create_task(read_formal_inventory())
+    vector_task = asyncio.create_task(read_vector_inventory())
     try:
         (root_is_dir, raw_entries, complete), inventory = await asyncio.gather(
             formal_task, vector_task
@@ -289,7 +293,11 @@ async def build_rfv_snapshot(
     for record_id, record in inventory.items():
         uri = str(record.get("uri") or "")
         relative_path = _relative_uri(root, uri)
-        if relative_path is None:
+        if relative_path is None or (
+            not recursive
+            and relative_path
+            and (not include_direct_children or "/" in relative_path)
+        ):
             raise ValueError(f"RFV vector record is outside target: {uri}")
         level = int(record.get("level", -1))
         fields = {

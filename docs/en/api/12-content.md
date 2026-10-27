@@ -683,6 +683,12 @@ Session namespaces are not supported by `reindex()`. Requests for
 `viking://session/...` or `viking://user/<user_id>/sessions/...` are rejected;
 when reindexing a broader user namespace, session subtrees are skipped.
 
+For a concrete user root, namespace reindex processes only `resources`, skill packages under `skills`, memory shards under `memories`, and peer resources/memories under `peers`. Session, privacy and unknown subtrees are excluded from this broader operation. User/global discovery uses shallow paginated listings; it does not recursively traverse the global root, user roots or the peers container. An actor-peer view must use an explicit visible content target because a broader namespace cannot provide a complete formal view.
+
+Each of the four user prefixes supplies one complete lightweight vector inventory, which is reused by its packages, shards and peers. Resource/skill reindex also uses a complete inventory without caller pagination. Retryable vector-store failures and inventory count drift retry the whole read at most three times; an incomplete inventory is never used for deletion. Concrete content targets keep their requested URI scope instead of expanding to sibling roots.
+
+Namespace reindex discovers dynamic roots from both formal entries and vector records, so it can clean a missing memory root/shard, skill package or peer content root while holding the parent scope's lock. Directly requesting a target that is already absent still returns `NOT_FOUND`; use an existing parent content scope or namespace to reconcile its orphan vectors.
+
 **Modes**
 
 - `vectors_only`: compares current source MD5 values with vector-record MD5 values through RFV and rebuilds only missing or stale L0/L1/L2 records; it does not rewrite `.abstract.md` or `.overview.md`

@@ -768,6 +768,116 @@ async def test_reindex_inventory_reads_one_complete_prefix_without_scroll_pages(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("recursive", "include_direct_children", "expected_ids", "expected_depth"),
+    [
+        (False, False, {"root-l0"}, 0),
+        (False, True, {"root-l0", "child-l2"}, 1),
+        (True, True, {"root-l0", "child-l2", "grandchild-l2"}, -1),
+    ],
+)
+async def test_reindex_inventory_queries_requested_depth_once(
+    recursive, include_direct_children, expected_ids, expected_depth
+):
+    root = "viking://user/alice/resources/docs"
+    backend = _RealAclMemoryTransferBackend(
+        [
+            _record("root-l0", root, level=0),
+            _record("child-l2", f"{root}/a.md"),
+            _record("grandchild-l2", f"{root}/nested/b.md"),
+            _record("outside", f"{root}-other/a.md"),
+        ]
+    )
+
+    records = await backend.get_reindex_inventory_under_uri(
+        root,
+        ctx=_ctx(),
+        recursive=recursive,
+        include_direct_children=include_direct_children,
+    )
+
+    assert set(records) == expected_ids
+    assert backend.scroll_filters == []
+    assert len(backend.filter_calls) == 1
+    scope, limit, offset = backend.filter_calls[0]
+    assert PathScope("uri", root, depth=expected_depth) in scope.conds
+    assert (limit, offset) == (len(expected_ids), 0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("recursive", "include_direct_children", "record_uri"),
+    [
+        (False, True, "viking://user/alice/resources/docs/nested/a.md"),
+        (False, False, "viking://user/alice/resources/docs/a.md"),
+        (False, False, "viking://user/alice/resources/docs#chunk_0000"),
+        (True, False, "viking://user/alice/resources/docs-other/a.md"),
+        (True, False, "viking://user/bob/resources/docs/a.md"),
+        (True, False, ""),
+    ],
+)
+async def test_reindex_inventory_rejects_backend_records_outside_requested_depth(
+    recursive, include_direct_children, record_uri
+):
+    root = "viking://user/alice/resources/docs"
+    backend = _RealAclMemoryTransferBackend([])
+    backend._strict_transfer_count = AsyncMock(return_value=1)
+    backend.filter = AsyncMock(return_value=[_record("bad-l2", record_uri)])
+
+    with pytest.raises(RuntimeError, match="invalid record"):
+        await backend.get_reindex_inventory_under_uri(
+            root,
+            ctx=_ctx(),
+            recursive=recursive,
+            include_direct_children=include_direct_children,
+        )
+
+    backend.filter.assert_awaited_once()
+    assert backend.scroll_filters == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("page", "expected_count", "error"),
+    [
+        ([{"id": "", "uri": "viking://resources/docs", "level": 0}], 1, "invalid record"),
+        ([{"id": "bad", "uri": "viking://resources/docs", "level": 3}], 1, "invalid record"),
+        (
+            [{"id": "bad", "uri": "viking://resources/docs", "level": "invalid"}],
+            1,
+            "invalid record",
+        ),
+        ([], 1, "records but count was 1"),
+        (
+            [
+                {"id": "same", "uri": "viking://resources/docs", "level": 0},
+                {"id": "same", "uri": "viking://resources/docs/a.md", "level": 2},
+            ],
+            2,
+            "duplicate record id",
+        ),
+    ],
+)
+async def test_reindex_inventory_validates_complete_records_with_direct_children(
+    page, expected_count, error
+):
+    backend = _RealAclMemoryTransferBackend([])
+    backend._strict_transfer_count = AsyncMock(return_value=expected_count)
+    backend.filter = AsyncMock(return_value=page)
+
+    with pytest.raises(RuntimeError, match=error):
+        await backend.get_reindex_inventory_under_uri(
+            "viking://resources/docs",
+            ctx=_ctx(),
+            recursive=False,
+            include_direct_children=True,
+        )
+
+    backend.filter.assert_awaited_once()
+    assert backend.scroll_filters == []
+
+
+@pytest.mark.asyncio
 async def test_incremental_inventory_by_uris_reads_exact_uri_groups_only():
     first = "viking://resources/docs/a.py"
     second = "viking://resources/docs/b.py"

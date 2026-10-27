@@ -2369,6 +2369,7 @@ class VikingVectorIndexBackend:
         ctx: RequestContext,
         output_fields: Optional[List[str]] = None,
         recursive: bool = True,
+        include_direct_children: bool = False,
     ) -> Dict[str, Dict[str, Any]]:
         """Load one complete lightweight reindex inventory without page-level planning."""
         projection = list(
@@ -2380,10 +2381,12 @@ class VikingVectorIndexBackend:
             )
         )
         canonical_uri = resolve_uri(uri).uri.rstrip("/")
+        root_parts = uri_parts(canonical_uri)
+        depth = -1 if recursive else 1 if include_direct_children else 0
         scope = And(
             [
                 Eq("account_id", ctx.account_id),
-                PathScope("uri", canonical_uri, depth=-1 if recursive else 0),
+                PathScope("uri", canonical_uri, depth=depth),
                 In("level", [0, 1, 2]),
             ]
         )
@@ -2408,13 +2411,19 @@ class VikingVectorIndexBackend:
             record_id = str(record.get("id") or "")
             record_uri = str(record.get("uri") or "")
             try:
+                record_parts = uri_parts(record_uri)
+            except ValueError:
+                record_parts = None
+            try:
                 level = int(record.get("level"))
             except (TypeError, ValueError):
                 level = -1
             if (
                 not record_id
                 or level not in {0, 1, 2}
-                or not uri_in_transfer_scope(record_uri, canonical_uri, recursive=recursive)
+                or record_parts is None
+                or record_parts[: len(root_parts)] != root_parts
+                or (depth >= 0 and len(record_parts) - len(root_parts) > depth)
             ):
                 raise RuntimeError(
                     f"Reindex inventory under {canonical_uri} returned an invalid record: "

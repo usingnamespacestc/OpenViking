@@ -683,6 +683,12 @@ HTTP 请求体会忽略未知字段，便于客户端与服务端在字段演进
 `viking://user/<user_id>/sessions/...` 会被拒绝；重建更大的 user 命名空间时，
 session 子树会被跳过。
 
+具体 user 根的 namespace reindex 只处理 `resources`、`skills` 下的 skill package、`memories` 下的 memory shard，以及 `peers` 下的 resources/memories。宽范围操作排除 session、privacy 与未知子树。user/global 使用分页浅层列表发现根，不递归遍历 global 根、user 根或 peers 容器。带 actor-peer 视图的请求应指定明确可见的内容目标，因为更大的 namespace 无法提供完整 F 视图。
+
+每个 user 的四个固定前缀各提供一份完整轻量 V inventory，package、shard 和 peer 复用其内存分组；resource/skill reindex 也使用完整 inventory，不在调用方分页。向量库标记为可重试的异常与 inventory 数量漂移，最多整份重试三次；不完整 inventory 不会用于删除。具体内容目标保持请求 URI 范围，不提升到兄弟根。
+
+namespace 从 F 条目和 V 记录共同发现动态根，因此可以在父 scope 持锁期间清理已经缺失的 memory 根/shard、skill package 或 peer 内容根。直接请求一个已不存在的目标仍返回 `NOT_FOUND`；应使用仍存在的父内容范围或 namespace 清理其孤儿向量。
+
 **模式说明**
 
 - `vectors_only`：通过 RFV 对比当前 source MD5 与向量记录 MD5，只重建缺失或过期的 L0/L1/L2；不会重写 `.abstract.md` 和 `.overview.md`
