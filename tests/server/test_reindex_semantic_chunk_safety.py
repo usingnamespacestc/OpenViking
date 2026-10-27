@@ -11,19 +11,28 @@ import pytest
 from openviking.service.reindex_executor import _ReindexRunContext
 from openviking.storage.errors import LockError
 from openviking.storage.vector_ids import vector_record_id
+from openviking.utils.ingest_options import IngestOptions
 from tests.server.test_reindex_memory_sources import ROOT, records, setup_memory
 
 
 @pytest.mark.asyncio
-async def test_memory_semantic_and_vectors_reconciles_then_queues_shared_work(monkeypatch):
+@pytest.mark.parametrize("uri", [ROOT, "viking://user/bob/memories"])
+async def test_memory_semantic_and_vectors_reconciles_then_queues_shared_work(monkeypatch, uri):
     executor, fs, db, ctx, counters = setup_memory(monkeypatch, {}, {})
     executor._reindex_memory_vectors = AsyncMock()
     executor._enqueue_reindex_semantic_message = AsyncMock()
-    run = _ReindexRunContext(ctx=ctx, counters=counters, lease={"lease_id": "outer"})
+    ingest_options = IngestOptions.from_search_tags(["team=search"], mode="append")
+    run = _ReindexRunContext(
+        ctx=ctx,
+        counters=counters,
+        lease={"lease_id": "outer"},
+        ingest_options=ingest_options,
+    )
     await executor._reindex_memory(
-        uri=ROOT,
+        uri=uri,
         mode="semantic_and_vectors",
         run=run,
+        root_is_dir=True,
         formal_entries=[],
         vector_inventory={},
     )
@@ -31,10 +40,11 @@ async def test_memory_semantic_and_vectors_reconciles_then_queues_shared_work(mo
     assert executor._reindex_memory_vectors.await_args.kwargs["reconcile_only"] is True
     call = executor._enqueue_reindex_semantic_message.await_args.kwargs
     assert call["root_is_dir"] is True and call["run"] is run
-    assert call["msg"].uri == ROOT
+    assert call["msg"].uri == uri
     assert call["msg"].context_type == "memory"
     assert call["msg"].skip_vectorization is False
     assert call["msg"].use_hierarchical_aggregation is True
+    assert call["msg"].ingest_options == ingest_options
 
 
 @pytest.mark.asyncio
