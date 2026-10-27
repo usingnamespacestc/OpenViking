@@ -210,6 +210,9 @@ async def test_unavailable_body_with_abstract_fallback_retires_legacy_chunks(mon
     inventory = records(("base", uri, 2), ("chunk", uri + "#chunk_0000", 2))
     inventory["base"]["abstract"] = "Existing summary"
     executor, fs, db, ctx, counters = setup_memory(monkeypatch, {}, inventory)
+    executor._best_memory_file_summary = AsyncMock(
+        side_effect=AssertionError("inventory abstract should bypass overview fallback")
+    )
     await executor._reindex_memory_vectors(
         uri=uri,
         ctx=ctx,

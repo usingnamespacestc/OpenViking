@@ -8,8 +8,10 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+import openviking.service.reindex_executor as reindex_module
 from openviking.service.reindex_executor import _ReindexRunContext
 from openviking.storage.errors import LockError
+from openviking.storage.queuefs.semantic_msg import SemanticMsg
 from openviking.storage.vector_ids import vector_record_id
 from openviking.utils.ingest_options import IngestOptions
 from tests.server.test_reindex_memory_sources import ROOT, records, setup_memory
@@ -61,6 +63,48 @@ async def test_missing_memory_root_cleans_without_queuing_semantics(monkeypatch)
         vector_inventory={},
     )
     executor._enqueue_reindex_semantic_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_reindex_semantic_enqueue_bypasses_memory_new_work_dedupe(monkeypatch):
+    executor, fs, db, ctx, counters = setup_memory(monkeypatch, {}, {})
+    lease = {"lease_id": "outer"}
+    handoff = {"owner_id": "semantic-worker"}
+    fs._async_agfs = SimpleNamespace(
+        pathlock_to_handoff=AsyncMock(return_value=handoff),
+        pathlock_handoff=AsyncMock(),
+    )
+    queue = SimpleNamespace(enqueue=AsyncMock(return_value="queued"))
+    monkeypatch.setattr(
+        reindex_module,
+        "get_service",
+        lambda: SimpleNamespace(viking_fs=fs, vikingdb_manager=db),
+    )
+    monkeypatch.setattr(
+        "openviking.storage.queuefs.get_queue_manager",
+        lambda: SimpleNamespace(
+            SEMANTIC="semantic",
+            get_queue=lambda *args, **kwargs: queue,
+        ),
+    )
+    run = _ReindexRunContext(
+        ctx=ctx,
+        counters=counters,
+        lease=lease,
+        lock_root_uri=ROOT,
+    )
+    msg = SemanticMsg(
+        uri=ROOT,
+        context_type="memory",
+        account_id=ctx.account_id,
+        user_id=ctx.user.user_id,
+        peer_id=ctx.user.user_id,
+        generation_trigger="reindex",
+    )
+
+    await executor._enqueue_reindex_semantic_message(msg=msg, root_is_dir=True, run=run)
+
+    queue.enqueue.assert_awaited_once_with(msg, deduplicate_memory=False)
 
 
 @pytest.mark.asyncio

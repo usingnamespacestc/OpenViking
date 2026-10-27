@@ -817,12 +817,6 @@ class ReindexExecutor:
             )
 
     @staticmethod
-    def _child_prefix(root: str) -> str:
-        if root.rstrip("/") == "viking:":
-            return "viking://"
-        return root.rstrip("/") + "/"
-
-    @staticmethod
     def _apply_embedding_wait_status(
         counters: _ReindexCounters,
         queue_status: dict[str, Any],
@@ -1227,8 +1221,14 @@ class ReindexExecutor:
 
         queue_manager = get_queue_manager()
         semantic_queue = queue_manager.get_queue(queue_manager.SEMANTIC, allow_create=True)
+
+        async def enqueue():
+            if msg.context_type == "memory":
+                return await semantic_queue.enqueue(msg, deduplicate_memory=False)
+            return await semantic_queue.enqueue(msg)
+
         if run.lease is None:
-            await semantic_queue.enqueue(msg)
+            await enqueue()
             return
 
         viking_fs = get_service().viking_fs
@@ -1250,17 +1250,7 @@ class ReindexExecutor:
         handoff = await plan_guard.to_handoff()
         msg.lock_handoff = handoff
         try:
-            enqueue_id = await plan_guard.handoff_and_dispatch(
-                handoff,
-                lambda: semantic_queue.enqueue(msg),
-                accepted=lambda result: result != "deduplicated",
-            )
-            if enqueue_id == "deduplicated":
-                await plan_guard.close()
-                if not acquired_plan_lease:
-                    run.lease = None
-                    run.lock = None
-                return
+            await plan_guard.handoff_and_dispatch(handoff, enqueue)
             if not acquired_plan_lease:
                 run.lease = None
                 run.lock = None
@@ -1330,45 +1320,24 @@ class ReindexExecutor:
                 inventory=vector_inventory,
                 reconcile_only=queue_semantics,
             )
-            if queue_semantics:
-                owner_ctx = self._content_owner_ctx(uri, run.ctx)
-                await self._enqueue_reindex_semantic_message(
-                    msg=SemanticMsg(
-                        uri=uri,
-                        context_type="memory",
-                        recursive=recursive,
-                        account_id=owner_ctx.account_id,
-                        user_id=owner_ctx.user.user_id,
-                        group_ids=list(owner_ctx.group_ids),
-                        peer_id=owner_ctx.user.user_id,
-                        role=str(owner_ctx.role),
-                        telemetry_id=get_current_telemetry().telemetry_id,
-                        ingest_options=run.ingest_options,
-                        generation_trigger="reindex",
-                        use_hierarchical_aggregation=True,
-                        propagate_to_parent=recursive,
-                    ),
-                    root_is_dir=True,
-                    run=run,
+        else:
+            await self._reindex_memory_vectors(
+                **self._with_ingest_options(
+                    {
+                        "uri": uri,
+                        "counters": run.counters,
+                        "ctx": run.ctx,
+                        "recursive": recursive,
+                        "vector_inventory": vector_inventory,
+                        "root_exists": root_exists,
+                        "root_is_dir": root_is_dir,
+                        "formal_entries": formal_entries,
+                        "lease_ref": run.lease,
+                        "reconcile_only": queue_semantics,
+                    },
+                    run.ingest_options,
                 )
-            return
-        await self._reindex_memory_vectors(
-            **self._with_ingest_options(
-                {
-                    "uri": uri,
-                    "counters": run.counters,
-                    "ctx": run.ctx,
-                    "recursive": recursive,
-                    "vector_inventory": vector_inventory,
-                    "root_exists": root_exists,
-                    "root_is_dir": root_is_dir,
-                    "formal_entries": formal_entries,
-                    "lease_ref": run.lease,
-                    "reconcile_only": queue_semantics,
-                },
-                run.ingest_options,
             )
-        )
         if queue_semantics:
             owner_ctx = self._content_owner_ctx(uri, run.ctx)
             await self._enqueue_reindex_semantic_message(
@@ -1735,24 +1704,20 @@ class ReindexExecutor:
                 body = body_source.text if body_source.exists else ""
                 memory_content = MemoryFileUtils.read(body).content if body else ""
                 existing = existing_by_uri_level.get((file_uri, int(ContextLevel.DETAIL)))
-                abstract = self._best_non_empty(
-                    self._record_abstract(existing),
-                    await self._best_memory_file_summary(
+                abstract = self._record_abstract(existing)
+                if not abstract:
+                    abstract = await self._best_memory_file_summary(
                         file_uri,
                         ctx=ctx,
-                        existing=existing,
                         overview_cache=overview_cache,
-                    ),
-                )
+                    )
                 if not body and existing is None:
                     file_counters.unsupported_records += 1
                     file_counters.warnings.append(f"No memory source found for {file_uri}")
                     return file_counters
 
                 parent_uri = VikingURI(file_uri).parent.uri
-                detail_abstract = (
-                    self._prefer_non_empty(abstract, memory_content, body) if body else abstract
-                )
+                detail_abstract = abstract or memory_content or body
                 await self._upsert_context(
                     uri=file_uri,
                     parent_uri=parent_uri,
@@ -1853,8 +1818,7 @@ class ReindexExecutor:
             # An actual filename wins over the virtual-chunk suffix syntax.
             if record_uri in live_file_uris:
                 continue
-            if record_uri not in live_file_uris:
-                orphan_ids.append(record_id)
+            orphan_ids.append(record_id)
 
         if not orphan_ids:
             return
@@ -1960,7 +1924,6 @@ class ReindexExecutor:
         uri: str,
         *,
         ctx: RequestContext,
-        existing: Optional[dict[str, Any]],
         overview_cache: dict[str, dict[str, str]],
     ) -> str:
         parent_uri = VikingURI(uri).parent.uri
@@ -1968,10 +1931,7 @@ class ReindexExecutor:
             raw = await self._safe_read_text(f"{parent_uri}/.overview.md", ctx=ctx)
             overview_cache[parent_uri] = SemanticProcessor._parse_overview_md(raw) if raw else {}
         file_name = uri.rsplit("/", 1)[-1]
-        return self._best_non_empty(
-            overview_cache[parent_uri].get(file_name, ""),
-            self._record_abstract(existing),
-        )
+        return overview_cache[parent_uri].get(file_name, "")
 
     async def _reindex_memory_directory_chain(
         self,
@@ -2284,15 +2244,3 @@ class ReindexExecutor:
         else:
             text = str(content or "")
         return _SourceRead(exists=True, text=text)
-
-    def _best_non_empty(self, *values: str) -> str:
-        for value in values:
-            if value:
-                return value
-        return ""
-
-    def _prefer_non_empty(self, *values: str) -> str:
-        for value in values:
-            if value:
-                return value
-        return ""
