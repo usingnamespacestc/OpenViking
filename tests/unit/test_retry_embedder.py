@@ -335,11 +335,11 @@ def test_factory_places_retry_inside_composite(monkeypatch):
 class GatedEmbedder(DenseEmbedderBase):
     """Holds each call open until its content's gate is set."""
 
-    def __init__(self, max_concurrent: int, reserved: int = 0):
-        super().__init__(
-            "gated",
-            {"max_concurrent": max_concurrent, "query_reserved_concurrency": reserved},
-        )
+    def __init__(self, max_concurrent: int, reserved: int | None = 0):
+        config = {"max_concurrent": max_concurrent}
+        if reserved is not None:
+            config["query_reserved_concurrency"] = reserved
+        super().__init__("gated", config)
         self.gates: dict[str, asyncio.Event] = {}
         self.started: list[str] = []
 
@@ -394,16 +394,53 @@ async def test_query_reservation_caps_documents_and_serves_queries_first():
 
 
 @pytest.mark.asyncio
-async def test_without_reservation_calls_share_one_fifo_limit():
-    embedder = GatedEmbedder(max_concurrent=2)
+async def test_without_reservation_queries_jump_the_queue_within_the_limit():
+    embedder = GatedEmbedder(max_concurrent=2, reserved=0)
     tasks = embedder.start("d1", "q1", "d2", "q2")
     await settle()
     assert embedder.started == ["d1", "q1"]
 
     await embedder.finish("d1")
-    assert embedder.started == ["d1", "q1", "d2"]
+    assert embedder.started == ["d1", "q1", "q2"]
+    await embedder.finish("q1")
+    assert embedder.started[-1] == "d2"
 
-    for content in ("q1", "d2", "q2"):
+    for content in ("d2", "q2"):
+        await embedder.finish(content)
+    await asyncio.gather(*tasks)
+
+
+@pytest.mark.asyncio
+async def test_query_bursts_cannot_starve_documents_on_a_single_slot():
+    embedder = GatedEmbedder(max_concurrent=1, reserved=None)
+    queries = [f"q{i}" for i in range(1, 7)]
+    tasks = embedder.start("d0")
+    await settle()
+    tasks += embedder.start("d1", *queries)
+    await settle()
+    assert embedder.started == ["d0"]
+
+    for content in ("d0", "q1", "q2", "q3"):
+        await embedder.finish(content)
+    assert embedder.started == ["d0", "q1", "q2", "q3", "q4"]
+    await embedder.finish("q4")
+    assert embedder.started[-1] == "d1"
+    await embedder.finish("d1")
+    assert embedder.started[-1] == "q5"
+
+    for content in ("q5", "q6"):
+        await embedder.finish(content)
+    await asyncio.gather(*tasks)
+
+
+@pytest.mark.asyncio
+async def test_unset_reservation_keeps_one_slot_for_queries():
+    embedder = GatedEmbedder(max_concurrent=3, reserved=None)
+    tasks = embedder.start("d1", "d2", "d3", "q1")
+    await settle()
+    assert embedder.started == ["d1", "d2", "q1"]
+
+    for content in ("d1", "d2", "d3", "q1"):
         await embedder.finish(content)
     await asyncio.gather(*tasks)
 
@@ -449,3 +486,14 @@ async def test_cancelled_waiters_do_not_strand_permits():
 def test_query_reservation_must_leave_document_capacity():
     with pytest.raises(ValueError, match="query_reserved_concurrency"):
         EmbeddingConfig(max_concurrent=2, query_reserved_concurrency=2)
+
+
+def test_unset_query_reservation_defaults_to_one_below_the_limit():
+    assert EmbeddingConfig(max_concurrent=1).effective_query_reserved_concurrency == 0
+    assert EmbeddingConfig(max_concurrent=10).effective_query_reserved_concurrency == 1
+    assert (
+        EmbeddingConfig(
+            max_concurrent=10, query_reserved_concurrency=0
+        ).effective_query_reserved_concurrency
+        == 0
+    )

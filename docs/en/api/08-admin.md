@@ -905,7 +905,7 @@ cannot be combined with `dense` or `sparse`.
 | --- | --- | --- | --- |
 | `embedding.dense` / `sparse` / `hybrid` | Mode existence is create-only | Object/null | Three model output modes; cannot be added, removed, or switched after creation |
 | `embedding.max_concurrent` | Dynamic | Integer, `>= 1` | Provider-call concurrency limit for this Account |
-| `embedding.query_reserved_concurrency` | Dynamic | Integer, `>= 0` and `< max_concurrent` | Provider-call slots reserved for retrieval queries |
+| `embedding.query_reserved_concurrency` | Dynamic | Integer, `>= 0` and `< max_concurrent`; unset means `min(1, max_concurrent - 1)` | Provider-call slots reserved for retrieval queries |
 | `embedding.max_retries` | Dynamic | Integer, `>= 0` | Retry count for transient provider failures |
 | `embedding.circuit_breaker.failure_threshold` | Dynamic | Integer, `>= 1` | Consecutive failures before opening the circuit |
 | `embedding.circuit_breaker.reset_timeout` | Dynamic | Number, `> 0` | Base circuit recovery wait in seconds |

@@ -66,26 +66,30 @@ class AsyncSemaphore:
     The thread lock only protects admission and handoff. Contended callers
     await a future on their own loop; no executor thread is occupied waiting.
 
-    ``reserved`` permits are usable only by ``priority`` callers, which are also
-    woken before ordinary waiters. Without a reservation every caller shares one
-    FIFO queue, so ``priority`` has no effect.
+    ``priority`` callers are woken before ordinary waiters, but after
+    ``max_priority_burst`` consecutive grants that bypassed an eligible ordinary
+    waiter, the next permit goes to the ordinary queue so it cannot starve.
+    ``reserved`` permits are additionally usable only by ``priority`` callers.
     """
 
-    def __init__(self, value: int = 1, *, reserved: int = 0) -> None:
+    def __init__(self, value: int = 1, *, reserved: int = 0, max_priority_burst: int = 4) -> None:
         if value < 0:
             raise ValueError("Semaphore initial value must be >= 0")
         if reserved < 0 or (reserved and reserved >= value):
             raise ValueError("Semaphore reserved value must be >= 0 and < initial value")
+        if max_priority_burst < 1:
+            raise ValueError("Semaphore max_priority_burst must be >= 1")
         self._value = value
         self._reserved = reserved
         self._ordinary_limit = value - reserved
         self._ordinary_held = 0
+        self._max_priority_burst = max_priority_burst
+        self._priority_streak = 0
         self._lock = threading.Lock()
         self._waiters: deque[Future[None]] = deque()
         self._priority_waiters: deque[Future[None]] = deque()
 
     async def acquire(self, *, priority: bool = False) -> None:
-        priority = priority and bool(self._reserved)
         waiters = self._priority_waiters if priority else self._waiters
         with self._lock:
             if not waiters and self._can_take(priority):
@@ -127,12 +131,24 @@ class AsyncSemaphore:
             self._ordinary_held += 1
 
     def _wake(self) -> None:
-        for priority, waiters in ((True, self._priority_waiters), (False, self._waiters)):
-            while waiters and self._can_take(priority):
-                waiter = waiters.popleft()
-                if waiter.set_running_or_notify_cancel():
-                    self._take(priority)
-                    waiter.set_result(None)
+        while True:
+            ordinary_ready = bool(self._waiters) and self._can_take(False)
+            priority_ready = bool(self._priority_waiters) and self._can_take(True)
+            if priority_ready and (
+                not ordinary_ready or self._priority_streak < self._max_priority_burst
+            ):
+                priority, waiters = True, self._priority_waiters
+            elif ordinary_ready:
+                priority, waiters = False, self._waiters
+            else:
+                return
+            waiter = waiters.popleft()
+            if not waiter.set_running_or_notify_cancel():
+                continue
+            self._take(priority)
+            # Only grants that passed over an eligible ordinary waiter count.
+            self._priority_streak = self._priority_streak + 1 if priority and ordinary_ready else 0
+            waiter.set_result(None)
 
     async def __aenter__(self) -> "AsyncSemaphore":
         await self.acquire()

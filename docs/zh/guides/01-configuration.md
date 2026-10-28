@@ -340,7 +340,7 @@ OpenAI 已于 2026 年 8 月 31 日[停止在 ChatGPT 登录的 Codex 中提供 
 | 参数 | 类型 | 说明 |
 |------|------|------|
 | `max_concurrent` | int | 最大并发 Embedding 请求数（`embedding.max_concurrent`，默认：`10`；必须 `>= 1`） |
-| `query_reserved_concurrency` | int | 在 `max_concurrent` 中仅供检索查询 Embedding 使用的并发数，避免索引占满全部并发；排队的查询也优先于排队的索引请求（默认：`0`；必须 `>= 0` 且 `< max_concurrent`） |
+| `query_reserved_concurrency` | int | 在 `max_concurrent` 中仅供检索查询 Embedding 使用的并发数，避免索引占满全部并发。排队的查询总是优先于排队的索引请求，但连续 4 次越过等待中的索引请求后，下一个空位会让给索引，避免索引饿死（默认：不设置，即 `min(1, max_concurrent - 1)`；设为 `0` 关闭预留；必须 `>= 0` 且 `< max_concurrent`） |
 | `max_retries` | int | Embedding provider 瞬时错误的最大重试次数（`embedding.max_retries`，默认：`3`；`0` 表示禁用重试） |
 | `text_source` | str | 文本文件向量化时使用的文本来源。`content_only` 读取原文内容；`summary_first` 优先使用摘要，没有摘要时回退到原文；`summary_only` 已弃用，作为 `summary_first` 的兼容别名；旧配置仍可加载，会记录警告并归一为 `summary_first`。默认：`content_only` |
 | `max_input_tokens` | int | 使用原文内容向量化时，发送给 embedding 模型的最大估算 token 数。默认：`4096` |

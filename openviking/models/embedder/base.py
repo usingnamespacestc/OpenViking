@@ -284,7 +284,8 @@ class EmbedderBase(ABC):
         # EmbeddingConfig rejects reservations that leave no indexing capacity;
         # clamp here so directly constructed embedders and wrappers still build.
         limit = max(1, self.max_concurrent)
-        reserved = int(self.config.get("query_reserved_concurrency", 0))
+        reserved = self.config.get("query_reserved_concurrency")
+        reserved = min(1, limit - 1) if reserved is None else int(reserved)
         # Loop-independent so HTTP and queue-worker loops share this embedder's limit.
         self._embed_semaphore = AsyncSemaphore(limit, reserved=max(0, min(reserved, limit - 1)))
         self.provider = self.config.get("provider", "unknown")

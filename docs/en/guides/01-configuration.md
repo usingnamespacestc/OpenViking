@@ -343,7 +343,7 @@ Embedding model configuration for vector search, supporting dense, sparse, and h
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `max_concurrent` | int | Maximum concurrent embedding requests (`embedding.max_concurrent`, default: `10`; must be `>= 1`) |
-| `query_reserved_concurrency` | int | Slots out of `max_concurrent` that only retrieval query embeddings may use, so indexing cannot occupy every slot; queued queries are also served before queued indexing requests (default: `0`; must be `>= 0` and `< max_concurrent`) |
+| `query_reserved_concurrency` | int | Slots out of `max_concurrent` that only retrieval query embeddings may use, so indexing cannot occupy every slot. Queued queries are always served before queued indexing requests, but after 4 consecutive grants that skipped a waiting indexing request, the next slot goes to indexing so it cannot starve (default: unset, meaning `min(1, max_concurrent - 1)`; `0` disables the reservation; must be `>= 0` and `< max_concurrent`) |
 | `max_retries` | int | Maximum retry attempts for transient embedding provider errors (`embedding.max_retries`, default: `3`; `0` disables retry) |
 | `text_source` | str | Text used for vectorizing text files. `content_only` reads raw content, `summary_first` uses summary when available and falls back to content, `summary_only` is a deprecated alias for `summary_first`; existing configurations still load, log a warning, and normalize to `summary_first`. Default: `content_only` |
 | `max_input_tokens` | int | Maximum estimated raw text tokens sent to the embedding model when content is used. Default: `4096` |

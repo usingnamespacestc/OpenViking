@@ -656,12 +656,13 @@ class EmbeddingConfig(BaseModel):
         ge=1,
         description="Maximum number of concurrent embedding requests",
     )
-    query_reserved_concurrency: int = Field(
-        default=0,
+    query_reserved_concurrency: Optional[int] = Field(
+        default=None,
         ge=0,
         description=(
             "Embedding request slots, out of max_concurrent, that only retrieval queries "
-            "may use; queued queries are also served before queued indexing requests"
+            "may use; unset means min(1, max_concurrent - 1), 0 disables the reservation. "
+            "Queued queries are served before queued indexing requests either way"
         ),
     )
     max_retries: int = Field(
@@ -722,11 +723,21 @@ class EmbeddingConfig(BaseModel):
             self.text_source = TEXT_SOURCE_SUMMARY_FIRST
         if self.text_source not in TEXT_SOURCES:
             raise ValueError("embedding.text_source must be one of: summary_first, content_only")
-        if self.query_reserved_concurrency >= self.max_concurrent:
+        if (
+            self.query_reserved_concurrency is not None
+            and self.query_reserved_concurrency >= self.max_concurrent
+        ):
             raise ValueError(
                 "embedding.query_reserved_concurrency must be less than embedding.max_concurrent"
             )
         return self
+
+    @property
+    def effective_query_reserved_concurrency(self) -> int:
+        """Query-only slots after applying the default to an unset reservation."""
+        if self.query_reserved_concurrency is None:
+            return min(1, self.max_concurrent - 1)
+        return self.query_reserved_concurrency
 
     def _create_embedder(
         self,
@@ -773,7 +784,7 @@ class EmbeddingConfig(BaseModel):
         runtime_config = {
             "max_retries": self.max_retries,
             "max_concurrent": self.max_concurrent,
-            "query_reserved_concurrency": self.query_reserved_concurrency,
+            "query_reserved_concurrency": self.effective_query_reserved_concurrency,
             "max_input_tokens": self.max_input_tokens,
         }
 
