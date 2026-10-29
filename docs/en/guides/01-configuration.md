@@ -2197,6 +2197,8 @@ How this relates to the other filters:
 | Plugin `recallQueryFilters` / `captureFilters` | One plugin | Personal tweaks: dropping `ultrathink`, skipping a kind of message, redaction |
 | Gateway [`client_rules`](../gateway/13-configuration.md#client-rules) | Model requests proxied by the gateway | The gateway's request classification and recall |
 
+A client knows which blocks it injected and can say so instead of leaving the server to guess. `X-OpenViking-Host-Envelope: botmux,claude-code` tries exactly those envelopes, in that order (built-in or `custom` names; they need not appear in `envelopes`), and `none` turns normalization off for the request. The header applies to message writes (`/sessions/{id}/messages`, `/messages/batch`) and to `find`, `search` and `recall`; an unknown name returns 400. Without the header, the configuration above applies.
+
 ### Usage Reporter
 
 The optional Usage Reporter extracts memory usage events from committed session tool parts. The built-in file log sink writes each event as one flat JSON object to a dedicated hourly rotating file:
